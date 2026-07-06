@@ -14,6 +14,7 @@ import androidx.work.WorkManager;
 import com.rebron1900.fcitx5enhanced.ConfigStorage;
 
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 同步调度器 — 管理 WorkManager 周期任务和即时同步。
@@ -22,6 +23,10 @@ public class SyncManager {
 
     private static final String TAG = "Fcitx5Sync";
     private static final String WORK_NAME = "rime_webdav_sync";
+
+    /** 全局互斥锁：防止 WorkManager + MainHook 同时同步。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean sSyncRunning =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     /** 根据配置注册/取消定时同步任务 */
     public static void scheduleSync(Context context) {
@@ -78,6 +83,36 @@ public class SyncManager {
                 });
 
         Log.i(TAG, "sync now triggered");
+    }
+
+    /**
+     * 尝试执行一次同步（互斥锁版）。
+     * 如果已有同步在跑，直接跳过不排队。
+     */
+    public static boolean runSyncOnce(Context context) {
+        if (!sSyncRunning.compareAndSet(false, true)) {
+            Log.d(TAG, "sync already in progress, skip");
+            return false;
+        }
+        try {
+            Context appCtx = context.getApplicationContext();
+            LocalFileAccess localAccess = LocalFileAccessFactory.create(appCtx);
+            WebDavSyncHelper helper = new WebDavSyncHelper(appCtx, localAccess);
+            WebDavSyncHelper.SyncResult result = helper.sync();
+            ConfigStorage.saveLastSyncResult(appCtx, result.toToastString(), System.currentTimeMillis());
+            Log.i(TAG, "sync done: " + result.toToastString());
+            return true;
+        } catch (IllegalArgumentException e) {
+            ConfigStorage.saveLastSyncResult(context, "配置错误: " + e.getMessage(), System.currentTimeMillis());
+            Log.e(TAG, "sync config error", e);
+            return false;
+        } catch (Exception e) {
+            ConfigStorage.saveLastSyncResult(context, "同步失败: " + e.getMessage(), System.currentTimeMillis());
+            Log.w(TAG, "sync run failed", e);
+            return false;
+        } finally {
+            sSyncRunning.set(false);
+        }
     }
 
     /** 初始化：应用启动时注册定时任务 */

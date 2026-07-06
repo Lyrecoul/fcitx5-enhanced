@@ -25,6 +25,18 @@ import java.lang.reflect.Method;
 public class FrostedGlassHelper {
     private static final String TAG = "Fcitx5Enh";
 
+    // ══════════════════════════════════════════
+    //  性能缓存
+    // ══════════════════════════════════════════
+
+    /** 缓存 customBackground ImageView 查找结果（key=InputView，View 销毁时自动失效） */
+    private static final java.util.WeakHashMap<View, ImageView> sCustomBgCache = new java.util.WeakHashMap<>();
+
+    /** 缓存 tint bitmap（key=指纹，bitmap 参数不变时复用） */
+    private static Bitmap sCachedTintBitmap = null;
+    private static int sCachedTintW = -1, sCachedTintH = -1;
+    private static int sCachedTintCfg = 0;  // blur+alpha+corner+keyBgColor+isDark 混合指纹
+
     public static void apply(View inputView, MainHook.Config c, MainHook.ThemeInfo ti) {
         applyFrostedGlass(inputView, c, ti);
         applyRoundedCorners(inputView, c, ti);
@@ -70,7 +82,29 @@ public class FrostedGlassHelper {
                     int alpha = c.alpha;
                     int w = Math.max(1, bg.getWidth());
                     int h = Math.max(1, bg.getHeight());
-                    Bitmap tint = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+
+                    // 计算指纹：alpha + corner + w + h + keyBgColor + isDark
+                    int tintFp = alpha ^ (c.corner << 8) ^ (w << 12) ^ (h << 18)
+                               ^ keyBgColor ^ (isDark ? 0x20000000 : 0);
+
+                    Bitmap tint;
+                    if (tintFp == sCachedTintCfg && w == sCachedTintW && h == sCachedTintH
+                            && sCachedTintBitmap != null && !sCachedTintBitmap.isRecycled()) {
+                        // 配置+尺寸相同，复用缓存的 bitmap
+                        tint = sCachedTintBitmap;
+                        tint.eraseColor(Color.TRANSPARENT);  // 清空复用
+                        Log.d(TAG, "reuse cached tint bitmap");
+                    } else {
+                        // 创建新 bitmap，更新缓存
+                        if (sCachedTintBitmap != null && !sCachedTintBitmap.isRecycled()) {
+                            sCachedTintBitmap.recycle();
+                        }
+                        tint = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                        sCachedTintBitmap = tint;
+                        sCachedTintW = w;
+                        sCachedTintH = h;
+                        sCachedTintCfg = tintFp;
+                    }
                     Canvas cnv = new Canvas(tint);
 
                     int topColor, bottomColor;
@@ -171,7 +205,24 @@ public class FrostedGlassHelper {
             }
 
             // 直接用传入的 keyBgColor，不再反射
-            Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            int tintFp = alpha ^ (c.corner << 8) ^ (w << 12) ^ (h << 18)
+                       ^ keyBgColor ^ (isDark ? 0x20000000 : 0);
+            Bitmap out;
+            if (tintFp == sCachedTintCfg && w == sCachedTintW && h == sCachedTintH
+                    && sCachedTintBitmap != null && !sCachedTintBitmap.isRecycled()) {
+                out = sCachedTintBitmap;
+                out.eraseColor(Color.TRANSPARENT);
+                Log.d(TAG, "fallback reuse cached tint bitmap");
+            } else {
+                if (sCachedTintBitmap != null && !sCachedTintBitmap.isRecycled()) {
+                    sCachedTintBitmap.recycle();
+                }
+                out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+                sCachedTintBitmap = out;
+                sCachedTintW = w;
+                sCachedTintH = h;
+                sCachedTintCfg = tintFp;
+            }
             Canvas cnv = new Canvas(out);
 
             int c1, c2;
@@ -399,8 +450,12 @@ public class FrostedGlassHelper {
     //  字段查找 — R8 混淆后字段名不可靠，按类型匹配
     // ══════════════════════════════════════════
 
-    /** 在 InputView 中查找 customBackground ImageView */
+    /** 在 InputView 中查找 customBackground ImageView（结果缓存，避免每次遍历类层级） */
     private static ImageView findCustomBackground(View inputView) {
+        // 优先使用缓存（View 不变则结果肯定不变）
+        ImageView cached = sCustomBgCache.get(inputView);
+        if (cached != null) return cached;
+
         // 方式1: 字段名匹配（靓企鹅未混淆时可用）
         for (Class<?> c = inputView.getClass(); c != null; c = c.getSuperclass()) {
             for (Field f : c.getDeclaredFields()) {
@@ -410,6 +465,7 @@ public class FrostedGlassHelper {
                         ImageView iv = (ImageView) f.get(inputView);
                         if (iv != null && iv.getScaleType() == ImageView.ScaleType.CENTER_CROP) {
                             Log.i(TAG, "found customBackground by field: " + f.getName());
+                            sCustomBgCache.put(inputView, iv);
                             return iv;
                         }
                     } catch (Exception ignored) {}
@@ -427,12 +483,15 @@ public class FrostedGlassHelper {
                     ImageView iv = (ImageView) child;
                     Log.i(TAG, "found ImageView in keyboardView[" + i
                             + "] scaleType=" + iv.getScaleType());
+                    sCustomBgCache.put(inputView, iv);
                     return iv;
                 }
             }
         }
         // 方式3: 递归搜索整个 InputView
-        return findFirstImageView(inputView);
+        ImageView fallback = findFirstImageView(inputView);
+        if (fallback != null) sCustomBgCache.put(inputView, fallback);
+        return fallback;
     }
 
     private static View findKeyboardView(View inputView) {

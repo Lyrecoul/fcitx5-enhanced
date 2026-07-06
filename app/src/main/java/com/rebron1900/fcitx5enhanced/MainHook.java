@@ -45,6 +45,14 @@ public class MainHook extends XposedModule {
         public boolean leftBtn = true;
         public boolean rightBtn = true;
         public boolean keyBorder = true;
+
+        /** 快速比较配置是否相等（避免不必要的全量重绘） */
+        public boolean equals(Config o) {
+            return o != null
+                && blur == o.blur && alpha == o.alpha && keyAlpha == o.keyAlpha
+                && corner == o.corner && keyBorder == o.keyBorder
+                && leftBtn == o.leftBtn && rightBtn == o.rightBtn && voice == o.voice;
+        }
     }
 
     /** 主题信息快照，避免各 Helper 重复反射读 theme */
@@ -62,6 +70,9 @@ public class MainHook extends XposedModule {
     private View mCurrentInputView;
     private android.content.SharedPreferences.OnSharedPreferenceChangeListener mThemePrefListener;
     private boolean mConfigObserved;
+
+    /** 上次全量应用时的配置快照（用于跳过配置未变时的重复调用） */
+    private static final Config sLastAppliedCfg = new Config();
 
     // ══════════════════════════════════════════
     //  Hook 入口
@@ -197,6 +208,24 @@ public class MainHook extends XposedModule {
 
     private void applyAllEffects(View inputView) {
         readConfig(inputView);
+
+        // 配置未变 + 同一 InputView → 跳过全量重绘（性能优化）
+        // Broadcast/Provider/Theme 变更路径在调用前已更新 cfg，此处自然放行
+        if (sLastAppliedCfg.equals(cfg)) {
+            Log.d(TAG, "applyAllEffects: config unchanged, skip");
+            return;
+        }
+        // 更新快照
+        sLastAppliedCfg.blur = cfg.blur;
+        sLastAppliedCfg.alpha = cfg.alpha;
+        sLastAppliedCfg.keyAlpha = cfg.keyAlpha;
+        sLastAppliedCfg.corner = cfg.corner;
+        sLastAppliedCfg.toolbar = cfg.toolbar;
+        sLastAppliedCfg.voice = cfg.voice;
+        sLastAppliedCfg.leftBtn = cfg.leftBtn;
+        sLastAppliedCfg.rightBtn = cfg.rightBtn;
+        sLastAppliedCfg.keyBorder = cfg.keyBorder;
+
         Log.i(TAG, "applyAllEffects start");
 
         // 一次性提取主题信息，避免各 Helper 重复反射
@@ -488,14 +517,12 @@ public class MainHook extends XposedModule {
             long now = System.currentTimeMillis();
             int intervalMs = ConfigStorage.getSyncInterval(ctx) * 60 * 1000;
 
-            // 间隔检查（用设置里的 interval，默认30分钟）
             if (now - sLastSyncCheckTime < intervalMs) {
                 Log.d(TAG, "sync: interval not reached, skip");
                 return;
             }
             sLastSyncCheckTime = now;
 
-            // 检查 sync 目录是否存在
             java.io.File syncDir = ConfigStorage.getRimeSyncDir(ctx);
             if (!syncDir.exists()) {
                 Log.w(TAG, "sync: dir not exist: " + syncDir.getAbsolutePath());
@@ -504,26 +531,11 @@ public class MainHook extends XposedModule {
 
             Log.i(TAG, "sync triggered");
             new Thread(() -> {
-                try {
-                    com.rebron1900.fcitx5enhanced.sync.LocalFileAccess localAccess =
-                            com.rebron1900.fcitx5enhanced.sync.LocalFileAccessFactory.create(ctx);
-                    com.rebron1900.fcitx5enhanced.sync.WebDavSyncHelper helper =
-                            new com.rebron1900.fcitx5enhanced.sync.WebDavSyncHelper(ctx, localAccess);
-                    com.rebron1900.fcitx5enhanced.sync.WebDavSyncHelper.SyncResult result = helper.sync();
-                    ConfigStorage.saveLastSyncResult(ctx, result.toToastString(), System.currentTimeMillis());
-                    Log.i(TAG, "sync done: " + result.toToastString());
-
-                    // Toast 通知
-                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
-                        android.widget.Toast.makeText(ctx, result.toToastString(), android.widget.Toast.LENGTH_SHORT).show();
-                    });
-                } catch (Exception e) {
-                    ConfigStorage.saveLastSyncResult(ctx, "失败: " + e.getMessage(), System.currentTimeMillis());
-                    Log.w(TAG, "sync failed: " + e);
-                    new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
-                        android.widget.Toast.makeText(ctx, "同步失败: " + e.getMessage(), android.widget.Toast.LENGTH_SHORT).show();
-                    });
-                }
+                com.rebron1900.fcitx5enhanced.sync.SyncManager.runSyncOnce(ctx);
+                String result = com.rebron1900.fcitx5enhanced.ConfigStorage.getLastSyncResult(ctx);
+                new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+                    android.widget.Toast.makeText(ctx, result, android.widget.Toast.LENGTH_SHORT).show();
+                });
             }, "rime-webdav-sync").start();
         } catch (Exception e) {
             Log.w(TAG, "checkAndRunSync failed: " + e);

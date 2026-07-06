@@ -49,6 +49,9 @@ public class KeyEffectsHelper {
     /** 记录上次的 keyBorder 状态，检测是否变化 */
     private static boolean sLastKeyBorder = false;
 
+    /** 键盘 View 树哈希（快速检测结构变化，避免每次 layout 全量遍历） */
+    private static int sLastViewHash = 0;
+
     /** 每次 apply 时从 SP 读取的主题参数（不缓存，保证实时性） */
     private static int sKeyRadius = 4;
     private static boolean sSpecialKeyOval = false;
@@ -80,13 +83,18 @@ public class KeyEffectsHelper {
             applyKeyEffects(wmView, keyAlpha, c, isDark);
 
             // listener 处理新增按键和中英文切换
-            // 切换中英文时 fcitx5 会重建按键 view，但 childCount 可能不变
-            // 所以不能用 childCount 脏标记，必须每次 layout 都重做
+            // 使用 View 树哈希快速检测结构变化，命中跳过遍历以提升打字帧率
             mKeyLayoutListener = () -> {
                 if (sApplying) return;  // 防重入
                 sApplying = true;
                 try {
-                    Log.d(TAG, "layout listener fired, childCount=" + wmView.getChildCount());
+                    int newHash = computeViewHash(wmView);
+                    if (newHash == sLastViewHash) {
+                        Log.d(TAG, "layout: view tree unchanged, skip traversal");
+                        return;
+                    }
+                    sLastViewHash = newHash;
+                    Log.i(TAG, "layout: view tree changed, applying key effects");
                     applyKeyEffects(wmView, c.keyAlpha, c, isDark);
                 } finally {
                     sApplying = false;
@@ -94,6 +102,9 @@ public class KeyEffectsHelper {
             };
             mAttachedView = wmView;
             wmView.getViewTreeObserver().addOnGlobalLayoutListener(mKeyLayoutListener);
+
+            // 初始遍历后记录哈希值（下次 layout 变化时才重新遍历）
+            sLastViewHash = computeViewHash(wmView);
 
             // 解析资源 ID（只做一次）
             if (!sIdResolved) {
@@ -131,6 +142,16 @@ public class KeyEffectsHelper {
             mKeyLayoutListener = null;
             mAttachedView = null;
         }
+    }
+
+    /** 计算 View 树哈希（仅第一层子 View 的 identityHashCode，轻量快速）。 */
+    private static int computeViewHash(ViewGroup root) {
+        int hash = root.getChildCount();
+        for (int i = 0; i < root.getChildCount(); i++) {
+            View child = root.getChildAt(i);
+            hash = hash * 31 + System.identityHashCode(child);
+        }
+        return hash;
     }
 
     private static void makeKeysTranslucent(ViewGroup root, int alpha) {

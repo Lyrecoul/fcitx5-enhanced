@@ -12,7 +12,7 @@ import com.rebron1900.fcitx5enhanced.ConfigStorage;
 /**
  * WorkManager Worker — 定时执行 WebDAV 同步。
  *
- * 由 SettingsActivity 注册，MainHook 保活。
+ * 通过 SyncManager.runSyncOnce() 执行，保证多实例不并发。
  */
 public class SyncWorker extends Worker {
 
@@ -26,33 +26,20 @@ public class SyncWorker extends Worker {
     @Override
     public Result doWork() {
         Log.i(TAG, "SyncWorker started");
-        try {
-            WebDavSyncHelper helper = new WebDavSyncHelper(
-                    getApplicationContext(),
-                    LocalFileAccessFactory.create(getApplicationContext()));
-            WebDavSyncHelper.SyncResult result = helper.sync();
-            ConfigStorage.saveLastSyncResult(getApplicationContext(), result.toToastString(), System.currentTimeMillis());
-            Log.i(TAG, "SyncWorker done: " + result.toToastString());
 
-            // Toast 通知
-            new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
-                android.widget.Toast.makeText(getApplicationContext(), result.toToastString(), android.widget.Toast.LENGTH_SHORT).show();
-            });
-
+        if (!ConfigStorage.isWebDavEnabled(getApplicationContext())) {
+            Log.i(TAG, "sync disabled, skip");
             return Result.success();
-        } catch (IllegalArgumentException e) {
-            // 配置错误（URL/账号未填），不重试
-            String msg = "同步失败: " + e.getMessage();
-            ConfigStorage.saveLastSyncResult(getApplicationContext(), msg, System.currentTimeMillis());
-            Log.e(TAG, "SyncWorker config error", e);
-            new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
-                android.widget.Toast.makeText(getApplicationContext(), msg, android.widget.Toast.LENGTH_LONG).show();
-            });
-            return Result.failure();
-        } catch (Exception e) {
-            ConfigStorage.saveLastSyncResult(getApplicationContext(), "失败: " + e.getMessage(), System.currentTimeMillis());
-            Log.e(TAG, "SyncWorker failed", e);
-            return Result.retry();
         }
+
+        SyncManager.runSyncOnce(getApplicationContext());
+        String result = ConfigStorage.getLastSyncResult(getApplicationContext());
+        Log.i(TAG, "SyncWorker done: " + result);
+
+        new android.os.Handler(android.os.Looper.getMainLooper()).post(() -> {
+            android.widget.Toast.makeText(getApplicationContext(), result, android.widget.Toast.LENGTH_SHORT).show();
+        });
+
+        return Result.success();
     }
 }

@@ -91,7 +91,8 @@ public class WebDavSyncHelper {
                 .connectTimeout(15, TimeUnit.SECONDS)
                 .readTimeout(30, TimeUnit.SECONDS)
                 .writeTimeout(30, TimeUnit.SECONDS)
-                .followRedirects(false);
+                .followRedirects(true)
+                .followSslRedirects(true);
 
         this.client = builder.build();
     }
@@ -371,45 +372,71 @@ public class WebDavSyncHelper {
         }
     }
 
-    /** 上传单个文件，自动创建父目录 */
+    /** 上传单个文件，自动创建父目录（带 HTTP 423 锁等待重试） */
     private boolean uploadFile(String relPath) {
-        try {
-            if (!localAccess.exists(relPath)) {
-                appendLog("✗ 本地不存在: " + relPath);
-                return false;
-            }
+        int maxRetries = 3;
+        int baseDelayMs = 500;
+        for (int attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                if (!localAccess.exists(relPath)) {
+                    appendLog("✗ 本地不存在: " + relPath);
+                    return false;
+                }
 
-            // 确保远端父目录存在
-            String parent = relPath.contains("/")
-                    ? relPath.substring(0, relPath.lastIndexOf('/'))
-                    : "";
-            if (!parent.isEmpty()) {
-                mkcolRecursive(parent);
-            }
+                // 确保远端父目录存在
+                String parent = relPath.contains("/")
+                        ? relPath.substring(0, relPath.lastIndexOf('/'))
+                        : "";
+                if (!parent.isEmpty()) {
+                    mkcolRecursive(parent);
+                }
 
-            String url = baseUrl + relPath.replace(" ", "%20");
-            try (InputStream is = localAccess.openRead(relPath)) {
-                byte[] data = readAllBytes(is);
-                RequestBody body = RequestBody.create(data, MediaType.parse("application/octet-stream"));
-                Request request = new Request.Builder()
-                        .url(url)
-                        .put(body)
-                        .header("Authorization", credentials)
-                        .build();
+                String url = baseUrl + relPath.replace(" ", "%20");
+                try (InputStream is = localAccess.openRead(relPath)) {
+                    byte[] data = readAllBytes(is);
+                    RequestBody body = RequestBody.create(data, MediaType.parse("application/octet-stream"));
+                    Request request = new Request.Builder()
+                            .url(url)
+                            .put(body)
+                            .header("Authorization", credentials)
+                            .build();
 
-                try (Response response = client.newCall(request).execute()) {
-                    if (!response.isSuccessful()) {
-                        appendLog("✗ 上传失败: " + relPath + " HTTP " + response.code());
+                    try (Response response = client.newCall(request).execute()) {
+                        int code = response.code();
+                        if (code == 423) {
+                            appendLog("⏳ 文件被锁，等待重试: " + relPath + " (" + (attempt + 1) + "/" + maxRetries + ")");
+                            try {
+                                Thread.sleep(baseDelayMs * (1 << attempt));
+                            } catch (InterruptedException ie) {
+                                Thread.currentThread().interrupt();
+                                return false;
+                            }
+                            continue;
+                        }
+                        if (!response.isSuccessful()) {
+                            appendLog("✗ 上传失败: " + relPath + " HTTP " + code);
+                            return false;
+                        }
+                        appendLog("↑ " + relPath);
+                        return true;
+                    }
+                }
+            } catch (Exception e) {
+                if (attempt < maxRetries - 1) {
+                    appendLog("⏳ 上传异常，重试: " + relPath + " " + e.getMessage());
+                    try {
+                        Thread.sleep(baseDelayMs * (1 << attempt));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
                         return false;
                     }
-                    appendLog("↑ " + relPath);
-                    return true;
+                } else {
+                    appendLog("✗ 上传异常: " + relPath + " " + e.getMessage());
+                    return false;
                 }
             }
-        } catch (Exception e) {
-            appendLog("✗ 上传异常: " + relPath + " " + e.getMessage());
-            return false;
         }
+        return false;
     }
 
     /** 递归创建远端目录（MKCOL） */
