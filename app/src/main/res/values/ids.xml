@@ -1,4 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <item name="tag_frosted_tint" type="id" />
+    <item name="tag_toolbar_original_background" type="id" />
+    <item name="tag_original_decor_background" type="id" />
+    <item name="tag_original_input_background" type="id" />
+    <item name="tag_original_frosted_background" type="id" />
+    <item name="tag_original_frosted_drawable" type="id" />
+    <item name="tag_original_frosted_alpha" type="id" />
+    <item name="tag_original_frosted_foreground" type="id" />
+    <item name="tag_voice_client" type="id" />
+    <item name="tag_preedit_state_saved" type="id" />
+    <item name="tag_original_preedit_background" type="id" />
+    <item name="tag_original_preedit_layout" type="id" />
+    <item name="tag_original_window_background" type="id" />
+    <item name="tag_window_background_saved" type="id" />
 </resources>

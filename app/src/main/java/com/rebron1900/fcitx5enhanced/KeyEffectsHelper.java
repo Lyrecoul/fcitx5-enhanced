@@ -18,16 +18,22 @@ public class KeyEffectsHelper {
     private static final String TAG = "Fcitx5Enh";
 
     private static ViewTreeObserver.OnGlobalLayoutListener mKeyLayoutListener;
-    private static ViewGroup mAttachedView;
+    /** 弱引用：防止 static 强引用旧键盘树导致泄漏 */
+    private static java.lang.ref.WeakReference<ViewGroup> mAttachedViewRef;
 
     /** 保存每个按键的原始 foreground（press highlight），防止重绘时嵌套叠加。 */
-    private static final WeakHashMap<View, Drawable> sOriginalForegrounds = new WeakHashMap<>();
+    private static final WeakHashMap<View, java.lang.ref.WeakReference<Drawable>> sOriginalForegrounds =
+            new WeakHashMap<>();
+
+    /** 记录被修改过的 drawable alpha，以便关闭透明度效果时恢复原值。 */
+    private static final WeakHashMap<Drawable, Integer> sOriginalAlphas = new WeakHashMap<>();
 
     /** 标记已设置描边的 view，避免重复设置 */
     private static final WeakHashMap<View, Boolean> sBorderedViews = new WeakHashMap<>();
 
-    /** 缓存 appearanceView 反射结果（View→View），miss 不缓存（反射失败本身就很快） */
-    private static final WeakHashMap<View, View> sAppearanceCache = new WeakHashMap<>();
+    /** 缓存 appearanceView 反射结果；WeakReference 防止 value 反向持有 key。 */
+    private static final WeakHashMap<View, java.lang.ref.WeakReference<View>> sAppearanceCache =
+            new WeakHashMap<>();
 
     /** 缓存 Field 对象（Class→Field），避免重复 getDeclaredField */
     private static final WeakHashMap<Class<?>, Field> sAppearanceFieldCache = new WeakHashMap<>();
@@ -40,14 +46,8 @@ public class KeyEffectsHelper {
     /** 标记 listener 中是否正在执行，防止重入 */
     private static boolean sApplying = false;
 
-    /** 记录上次遍历的 childCount，避免无变化时重复遍历 */
-    private static int sLastChildCount = -1;
-
-    /** 记录上次的 wmView，检测 InputView 是否变化 */
-    private static ViewGroup sLastWmView = null;
-
-    /** 记录上次的 keyBorder 状态，检测是否变化 */
-    private static boolean sLastKeyBorder = false;
+    /** 记录上次的 wmView（弱引用），检测 InputView 是否变化 */
+    private static java.lang.ref.WeakReference<ViewGroup> sLastWmViewRef = null;
 
     /** 键盘 View 树哈希（快速检测结构变化，避免每次 layout 全量遍历） */
     private static int sLastViewHash = 0;
@@ -58,7 +58,8 @@ public class KeyEffectsHelper {
 
     public static void apply(View inputView, MainHook.Config c, boolean isDark) {
         try {
-            Field wf = inputView.getClass().getDeclaredField("windowManager");
+            Field wf = findField(inputView.getClass(), "windowManager");
+            if (wf == null) throw new NoSuchFieldException("windowManager");
             wf.setAccessible(true);
             Object wm = wf.get(inputView);
             Method gv = wm.getClass().getMethod("getView");
@@ -67,63 +68,52 @@ public class KeyEffectsHelper {
 
             int keyAlpha = c.keyAlpha;
 
+            // 主题参数必须在首次遍历前读取，否则首轮描边会使用默认圆角。
+            readThemePreferences(inputView);
+            resolveSpecialKeyIds(inputView);
+
             // 移除旧 listener
             removeOldListener();
 
             // 只在 InputView 变化时清除缓存（新 view 树，旧缓存无效）
-            if (wmView != sLastWmView) {
+            ViewGroup lastWm = sLastWmViewRef != null ? sLastWmViewRef.get() : null;
+            if (wmView != lastWm) {
                 sBorderedViews.clear();
                 sOriginalForegrounds.clear();
                 sAppearanceCache.clear();
-                sLastWmView = wmView;
+                sLastWmViewRef = new java.lang.ref.WeakReference<>(wmView);
             }
-            sLastChildCount = -1;
 
             // 单次遍历完成透明度+描边，避免两次全树遍历
             applyKeyEffects(wmView, keyAlpha, c, isDark);
 
             // listener 处理新增按键和中英文切换
             // 使用 View 树哈希快速检测结构变化，命中跳过遍历以提升打字帧率
+            final java.lang.ref.WeakReference<ViewGroup> wmViewRef =
+                    new java.lang.ref.WeakReference<>(wmView);
             mKeyLayoutListener = () -> {
                 if (sApplying) return;  // 防重入
+                ViewGroup current = wmViewRef.get();
+                if (current == null) return;
                 sApplying = true;
                 try {
-                    int newHash = computeViewHash(wmView);
+                    int newHash = computeViewHash(current);
                     if (newHash == sLastViewHash) {
                         Log.d(TAG, "layout: view tree unchanged, skip traversal");
                         return;
                     }
                     sLastViewHash = newHash;
                     Log.i(TAG, "layout: view tree changed, applying key effects");
-                    applyKeyEffects(wmView, c.keyAlpha, c, isDark);
+                    applyKeyEffects(current, c.keyAlpha, c, isDark);
                 } finally {
                     sApplying = false;
                 }
             };
-            mAttachedView = wmView;
+            mAttachedViewRef = new java.lang.ref.WeakReference<>(wmView);
             wmView.getViewTreeObserver().addOnGlobalLayoutListener(mKeyLayoutListener);
 
             // 初始遍历后记录哈希值（下次 layout 变化时才重新遍历）
             sLastViewHash = computeViewHash(wmView);
-
-            // 解析资源 ID（只做一次）
-            if (!sIdResolved) {
-                sIdResolved = true;
-                String pkg = inputView.getContext().getPackageName();
-                android.content.res.Resources res = inputView.getContext().getResources();
-                sIdReturn = res.getIdentifier("button_return", "id", pkg);
-                sIdSwitch = res.getIdentifier("button_layout_switch", "id", pkg);
-            }
-
-            // 每次 apply 都读 SP（保证药丸设置实时生效）
-            // 动态获取包名，兼容原版和靓企鹅
-            try {
-                String pkg = inputView.getContext().getPackageName();
-                SharedPreferences sp = inputView.getContext().getSharedPreferences(
-                        pkg + "_preferences", Context.MODE_PRIVATE);
-                sKeyRadius = sp.getInt("key_radius", 4);
-                sSpecialKeyOval = sp.getBoolean("special_key_oval_shape", false);
-            } catch (Exception ignored) {}
 
             Log.i(TAG, "key effects: alpha=" + keyAlpha);
         } catch (Throwable t) {
@@ -131,62 +121,68 @@ public class KeyEffectsHelper {
         }
     }
 
-    private static void removeOldListener() {
-        if (mKeyLayoutListener != null && mAttachedView != null) {
+    private static Field findField(Class<?> start, String name) {
+        for (Class<?> cls = start; cls != null && cls != Object.class; cls = cls.getSuperclass()) {
             try {
-                ViewTreeObserver vto = mAttachedView.getViewTreeObserver();
+                return cls.getDeclaredField(name);
+            } catch (NoSuchFieldException ignored) {}
+        }
+        return null;
+    }
+
+    private static void removeOldListener() {
+        ViewGroup attached = mAttachedViewRef != null ? mAttachedViewRef.get() : null;
+        if (mKeyLayoutListener != null && attached != null) {
+            try {
+                ViewTreeObserver vto = attached.getViewTreeObserver();
                 if (vto.isAlive()) {
                     vto.removeOnGlobalLayoutListener(mKeyLayoutListener);
                 }
             } catch (Exception ignored) {}
-            mKeyLayoutListener = null;
-            mAttachedView = null;
         }
+        mKeyLayoutListener = null;
+        mAttachedViewRef = null;
     }
 
-    /** 计算 View 树哈希（仅第一层子 View 的 identityHashCode，轻量快速）。 */
+    /** 计算有限深度的 View 树哈希，覆盖语言切换时替换的内部按键。 */
     private static int computeViewHash(ViewGroup root) {
-        int hash = root.getChildCount();
+        return computeViewHash(root, 0);
+    }
+
+    private static int computeViewHash(ViewGroup root, int depth) {
+        int hash = 31 + root.getChildCount();
+        if (depth >= 4) return hash;
         for (int i = 0; i < root.getChildCount(); i++) {
             View child = root.getChildAt(i);
             hash = hash * 31 + System.identityHashCode(child);
+            if (child instanceof ViewGroup) {
+                hash = hash * 31 + computeViewHash((ViewGroup) child, depth + 1);
+            }
         }
         return hash;
     }
 
-    private static void makeKeysTranslucent(ViewGroup root, int alpha) {
-        if (alpha > 250) return;
-        for (int i = 0; i < root.getChildCount(); i++) {
-            View child = root.getChildAt(i);
-            try {
-                View appView = findAppearanceView(child);
-                if (appView != null) {
-                    Drawable bg = appView.getBackground();
-                    if (bg != null) {
-                        if (bg instanceof android.graphics.drawable.LayerDrawable) {
-                            android.graphics.drawable.LayerDrawable ld =
-                                (android.graphics.drawable.LayerDrawable) bg;
-                            for (int j = 0; j < ld.getNumberOfLayers(); j++) {
-                                Drawable layer = ld.getDrawable(j);
-                                if (layer != null) layer.setAlpha(alpha);
-                            }
-                        } else {
-                            bg.setAlpha(alpha);
-                        }
-                    }
-                    tryAgainDeeper(appView, alpha);
-                }
-            } catch (Exception ignored) {}
-            if (child instanceof ViewGroup) {
-                makeKeysTranslucent((ViewGroup) child, alpha);
-            }
-        }
+    private static void resolveSpecialKeyIds(View inputView) {
+        if (sIdResolved) return;
+        sIdResolved = true;
+        String pkg = inputView.getContext().getPackageName();
+        android.content.res.Resources res = inputView.getContext().getResources();
+        sIdReturn = res.getIdentifier("button_return", "id", pkg);
+        sIdSwitch = res.getIdentifier("button_layout_switch", "id", pkg);
     }
 
-    /** 单次遍历完成透明度+描边，避免两次全树遍历 */
+    private static void readThemePreferences(View inputView) {
+        try {
+            String pkg = inputView.getContext().getPackageName();
+            SharedPreferences sp = inputView.getContext().getSharedPreferences(
+                    pkg + "_preferences", Context.MODE_PRIVATE);
+            sKeyRadius = sp.getInt("key_radius", 4);
+            sSpecialKeyOval = sp.getBoolean("special_key_oval_shape", false);
+        } catch (Exception ignored) {}
+    }
+
     private static void applyKeyEffects(ViewGroup root, int alpha,
                                          MainHook.Config c, boolean isDark) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M && alpha > 250) return;
         boolean needAlpha = alpha <= 250;
         boolean needBorder = c.keyBorder;
 
@@ -195,36 +191,63 @@ public class KeyEffectsHelper {
             try {
                 View appView = findAppearanceView(child);
                 if (appView != null) {
-                    // 透明度
-                    if (needAlpha) {
-                        Drawable bg = appView.getBackground();
-                        if (bg != null) {
-                            if (bg instanceof android.graphics.drawable.LayerDrawable) {
-                                android.graphics.drawable.LayerDrawable ld =
-                                    (android.graphics.drawable.LayerDrawable) bg;
-                                for (int j = 0; j < ld.getNumberOfLayers(); j++) {
-                                    Drawable layer = ld.getDrawable(j);
-                                    if (layer != null) layer.setAlpha(alpha);
-                                }
-                            } else {
-                                bg.setAlpha(alpha);
-                            }
+                    Drawable bg = appView.getBackground();
+                    if (bg != null) {
+                        if (needAlpha) {
+                            setDrawableAlphaTree(bg, alpha);
+                        } else {
+                            restoreDrawableAlphaTree(bg);
                         }
-                        tryAgainDeeper(appView, alpha);
                     }
-                    // 描边
+
+                    // 描边配置、主题或圆角变化时都重建 Drawable，避免旧缓存阻止更新。
                     if (needBorder) {
-                        if (!sBorderedViews.containsKey(appView)) {
-                            applyKeyGlassBorder(appView, c, isDark);
-                        }
+                        applyKeyGlassBorder(appView, c, isDark);
                     } else {
-                        // keyBorder 关闭时移除已有描边
                         removeBorderFromView(appView);
                     }
                 }
             } catch (Exception ignored) {}
             if (child instanceof ViewGroup) {
                 applyKeyEffects((ViewGroup) child, alpha, c, isDark);
+            }
+        }
+    }
+
+    private static void rememberDrawableAlpha(Drawable drawable) {
+        if (!sOriginalAlphas.containsKey(drawable)) {
+            sOriginalAlphas.put(drawable, drawable.getAlpha());
+        }
+    }
+
+    private static void setDrawableAlphaTree(Drawable drawable, int alpha) {
+        rememberDrawableAlpha(drawable);
+        drawable.setAlpha(alpha);
+        if (drawable instanceof android.graphics.drawable.InsetDrawable) {
+            Drawable inner = ((android.graphics.drawable.InsetDrawable) drawable).getDrawable();
+            if (inner != null) setDrawableAlphaTree(inner, alpha);
+        } else if (drawable instanceof android.graphics.drawable.LayerDrawable) {
+            android.graphics.drawable.LayerDrawable layer =
+                    (android.graphics.drawable.LayerDrawable) drawable;
+            for (int i = 0; i < layer.getNumberOfLayers(); i++) {
+                Drawable child = layer.getDrawable(i);
+                if (child != null) setDrawableAlphaTree(child, alpha);
+            }
+        }
+    }
+
+    private static void restoreDrawableAlphaTree(Drawable drawable) {
+        Integer original = sOriginalAlphas.get(drawable);
+        if (original != null) drawable.setAlpha(original);
+        if (drawable instanceof android.graphics.drawable.InsetDrawable) {
+            Drawable inner = ((android.graphics.drawable.InsetDrawable) drawable).getDrawable();
+            if (inner != null) restoreDrawableAlphaTree(inner);
+        } else if (drawable instanceof android.graphics.drawable.LayerDrawable) {
+            android.graphics.drawable.LayerDrawable layer =
+                    (android.graphics.drawable.LayerDrawable) drawable;
+            for (int i = 0; i < layer.getNumberOfLayers(); i++) {
+                Drawable child = layer.getDrawable(i);
+                if (child != null) restoreDrawableAlphaTree(child);
             }
         }
     }
@@ -241,37 +264,40 @@ public class KeyEffectsHelper {
             } else if (fg instanceof GlassBorderDrawable) {
                 appView.setForeground(null);
             }
+            sBorderedViews.remove(appView);
+            sOriginalForegrounds.remove(appView);
         } catch (Exception ignored) {}
     }
 
     /** 带缓存的 appearanceView 查找（缓存 Field 对象 + 结果） */
     private static View findAppearanceView(View v) {
-        View cached = sAppearanceCache.get(v);
+        java.lang.ref.WeakReference<View> cachedRef = sAppearanceCache.get(v);
+        View cached = cachedRef != null ? cachedRef.get() : null;
         if (cached != null) return cached;
+        if (cachedRef != null) sAppearanceCache.remove(v);
 
         Class<?> c = v.getClass();
         while (c != null && c != Object.class) {
-            // 先查 Field 缓存
             Field f = sAppearanceFieldCache.get(c);
+            if (f == null && sAppearanceFieldCache.containsKey(c)) {
+                c = c.getSuperclass();
+                continue;
+            }
             if (f == null) {
                 try {
                     f = c.getDeclaredField("appearanceView");
                     f.setAccessible(true);
                     sAppearanceFieldCache.put(c, f);
                 } catch (NoSuchFieldException ignored) {
-                    sAppearanceFieldCache.put(c, null); // 标记为不存在，避免重复查找
+                    sAppearanceFieldCache.put(c, null);
                     c = c.getSuperclass();
                     continue;
                 }
-            } else if (f == null) {
-                // 之前已标记为此类无此字段
-                c = c.getSuperclass();
-                continue;
             }
             try {
                 View result = (View) f.get(v);
                 if (result != null) {
-                    sAppearanceCache.put(v, result);
+                    sAppearanceCache.put(v, new java.lang.ref.WeakReference<>(result));
                 }
                 return result;
             } catch (Exception ignored) {}
@@ -280,72 +306,9 @@ public class KeyEffectsHelper {
         return null;
     }
 
-    private static void tryAgainDeeper(View v, int alpha) {
-        Drawable bg = v.getBackground();
-        if (bg == null) return;
-        if (bg instanceof android.graphics.drawable.InsetDrawable) {
-            Drawable inner = ((android.graphics.drawable.InsetDrawable) bg).getDrawable();
-            if (inner != null) inner.setAlpha(alpha);
-        } else if (bg instanceof android.graphics.drawable.LayerDrawable) {
-            android.graphics.drawable.LayerDrawable ld =
-                (android.graphics.drawable.LayerDrawable) bg;
-            for (int j = 0; j < ld.getNumberOfLayers(); j++) {
-                Drawable layer = ld.getDrawable(j);
-                if (layer != null) layer.setAlpha(alpha);
-            }
-        } else {
-            bg.setAlpha(alpha);
-        }
-    }
-
     // ══════════════════════════════════════════
     //  按键玻璃描边 — 每个按键顶部+转角
     // ══════════════════════════════════════════
-
-    /** 遍历键盘视图树，给每个按键的 appearanceView 加玻璃描边。 */
-    private static void addKeyBorders(ViewGroup root, MainHook.Config c, boolean isDark) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
-        for (int i = 0; i < root.getChildCount(); i++) {
-            View child = root.getChildAt(i);
-            try {
-                View appView = findAppearanceView(child);
-                if (appView != null) {
-                    if (sBorderedViews.containsKey(appView)) {
-                        continue;  // 已描边，跳过（不再检查 LayerDrawable）
-                    }
-                    applyKeyGlassBorder(appView, c, isDark);
-                }
-            } catch (Exception ignored) {}
-            if (child instanceof ViewGroup) {
-                addKeyBorders((ViewGroup) child, c, isDark);
-            }
-        }
-    }
-
-    /** 移除所有按键描边（keyBorder 关闭时调用） */
-    private static void removeKeyBorders(ViewGroup root) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return;
-        for (int i = 0; i < root.getChildCount(); i++) {
-            View child = root.getChildAt(i);
-            try {
-                View appView = findAppearanceView(child);
-                if (appView != null) {
-                    Drawable fg = appView.getForeground();
-                    if (fg instanceof android.graphics.drawable.LayerDrawable) {
-                        android.graphics.drawable.LayerDrawable ld = (android.graphics.drawable.LayerDrawable) fg;
-                        if (ld.getNumberOfLayers() == 2 && ld.getDrawable(0) instanceof GlassBorderDrawable) {
-                            appView.setForeground(ld.getDrawable(1));
-                        }
-                    } else if (fg instanceof GlassBorderDrawable) {
-                        appView.setForeground(null);
-                    }
-                }
-            } catch (Exception ignored) {}
-            if (child instanceof ViewGroup) {
-                removeKeyBorders((ViewGroup) child);
-            }
-        }
-    }
 
     /** 从 actual drawable 链解析：边距、圆角、形状 */
     private static class KeyBgInfo {
@@ -534,8 +497,9 @@ public class KeyEffectsHelper {
                         GlassBorderDrawable.MODE_DIAGONAL, false, useH, useV);
             }
 
-            Drawable originalFg = sOriginalForegrounds.get(keyView);
-            if (originalFg == null) {
+            java.lang.ref.WeakReference<Drawable> originalRef = sOriginalForegrounds.get(keyView);
+            Drawable originalFg = originalRef != null ? originalRef.get() : null;
+            if (originalRef == null) {
                 Drawable currentFg = keyView.getForeground();
                 // 如果当前 foreground 是上次 apply 的 LayerDrawable(GlassBorder + 原始)，解包
                 if (currentFg instanceof android.graphics.drawable.LayerDrawable) {
@@ -545,10 +509,12 @@ public class KeyEffectsHelper {
                     } else {
                         originalFg = currentFg;
                     }
+                } else if (currentFg instanceof GlassBorderDrawable) {
+                    originalFg = null;
                 } else {
                     originalFg = currentFg;
                 }
-                sOriginalForegrounds.put(keyView, originalFg);
+                sOriginalForegrounds.put(keyView, new java.lang.ref.WeakReference<>(originalFg));
             }
 
             if (originalFg != null) {

@@ -15,16 +15,14 @@ import android.graphics.drawable.Drawable;
 /**
  * 玻璃质感渐变描边 Drawable。
  * <p>
- * 三种模式：
+ * 两种模式：
  * <ul>
- *   <li><b>弹窗</b>（MODE_POPUP=0）：四边全描边 + 从上到下渐变</li>
  *   <li><b>键盘</b>（MODE_KEYBOARD=1）：仅上边 + 转角描边，转角→中间亮度递减，侧边渐隐，底部无</li>
  *   <li><b>按键对角</b>（MODE_DIAGONAL=2）：仅左上角↔右下角对角描边，中间淡化</li>
  * </ul>
  */
 public class GlassBorderDrawable extends Drawable {
 
-    public static final int MODE_POPUP = 0;
     public static final int MODE_KEYBOARD = 1;
     public static final int MODE_DIAGONAL = 2;
 
@@ -38,12 +36,6 @@ public class GlassBorderDrawable extends Drawable {
     private final boolean mIsOval;
     private final int mInsetH;  // 内部水平 inset（不通过 InsetDrawable，避免影响其他层）
     private final int mInsetV;  // 内部垂直 inset
-
-    // ── 弹窗模式 ──
-    private final Path mPopupPath = new Path();
-    private float mPopupY0, mPopupY1;
-    private int[] mPopupColors;
-    private float[] mPopupPositions;
 
     // ── 键盘模式（MODE_KEYBOARD） ──
     private final Path mKbTopPath = new Path();
@@ -63,25 +55,11 @@ public class GlassBorderDrawable extends Drawable {
     //  构造
     // ══════════════════════════════════════════
 
-    /** 弹窗模式（mode=MODE_POPUP） */
-    public GlassBorderDrawable(int fillColor, int topBorderColor, int bottomBorderColor,
-                               float cornerRadiusPx, float borderWidthPx) {
-        this(fillColor, topBorderColor, bottomBorderColor,
-                cornerRadiusPx, borderWidthPx, MODE_POPUP, false, 0, 0);
-    }
-
     /** 指定模式 */
     public GlassBorderDrawable(int fillColor, int topBorderColor, int bottomBorderColor,
                                float cornerRadiusPx, float borderWidthPx, int mode) {
         this(fillColor, topBorderColor, bottomBorderColor,
                 cornerRadiusPx, borderWidthPx, mode, false, 0, 0);
-    }
-
-    /** 指定模式 + 是否椭圆 */
-    public GlassBorderDrawable(int fillColor, int topBorderColor, int bottomBorderColor,
-                               float cornerRadiusPx, float borderWidthPx, int mode, boolean isOval) {
-        this(fillColor, topBorderColor, bottomBorderColor,
-                cornerRadiusPx, borderWidthPx, mode, isOval, 0, 0);
     }
 
     /** 指定模式 + 是否椭圆 + 内部 inset（不通过 InsetDrawable，避免影响 LayerDrawable 其他层） */
@@ -114,7 +92,6 @@ public class GlassBorderDrawable extends Drawable {
     @Override
     protected void onBoundsChange(Rect bounds) {
         super.onBoundsChange(bounds);
-        mPopupPath.reset();
         mKbTopPath.reset();
         mKbLeftFade.reset();
         mKbRightFade.reset();
@@ -123,25 +100,7 @@ public class GlassBorderDrawable extends Drawable {
         switch (mMode) {
             case MODE_DIAGONAL:  buildDiagonal(bounds); break;
             case MODE_KEYBOARD:  buildKeyboard(bounds); break;
-            default:             buildPopup(bounds);    break;
         }
-    }
-
-    private void buildPopup(Rect bounds) {
-        float inset = mBorderWidth;
-        mPopupPath.addRoundRect(
-                bounds.left + inset, bounds.top + inset,
-                bounds.right - inset, bounds.bottom - inset,
-                mRadius, mRadius, Path.Direction.CW);
-
-        float h = bounds.bottom - bounds.top;
-        float extend = h * 0.4f;
-        mPopupY0 = bounds.top - extend;
-        mPopupY1 = bounds.bottom + extend;
-        mPopupColors = new int[]{
-                mTopBorderColor, mTopBorderColor,
-                mBottomBorderColor, mBottomBorderColor};
-        mPopupPositions = new float[]{0f, 0.25f, 0.75f, 1f};
     }
 
     private void buildKeyboard(Rect bounds) {
@@ -221,17 +180,7 @@ public class GlassBorderDrawable extends Drawable {
         switch (mMode) {
             case MODE_DIAGONAL:  drawDiagonalMode(canvas); break;
             case MODE_KEYBOARD:  drawKeyboardMode(canvas); break;
-            default:             drawPopupMode(canvas);    break;
         }
-    }
-
-    private void drawPopupMode(Canvas canvas) {
-        mBorderPaint.setShader(new LinearGradient(
-                0, mPopupY0, 0, mPopupY1,
-                mPopupColors, mPopupPositions,
-                Shader.TileMode.CLAMP));
-        canvas.drawPath(mPopupPath, mFillPaint);
-        canvas.drawPath(mPopupPath, mBorderPaint);
     }
 
     private void drawKeyboardMode(Canvas canvas) {

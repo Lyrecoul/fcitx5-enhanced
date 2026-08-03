@@ -20,6 +20,7 @@ import android.view.inputmethod.InputConnection;
 import android.widget.Toast;
 
 import java.lang.ref.WeakReference;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /** 振幅回调接口 */
 interface AmplitudeListener {
@@ -32,7 +33,7 @@ interface AmplitudeListener {
  *
  * 关键设计：
  * - mConsumed 原子标记：回调发到主线程前先标记为"已消费"，防止重复提交
- * - stopSequence: 先 finishPcm → 再 stopAudio → 确保数据完整
+ * - stopSequence: 先停止并等待录音线程 → 再 finishPcm → 确保数据完整
  * - cancel(): 标记已取消 + unbind → 新按下时清除旧 session
  */
 public class VoiceInputClient {
@@ -60,23 +61,34 @@ public class VoiceInputClient {
     // ── 状态 ──
     private volatile boolean mHolding;
     private volatile boolean mConsumed;  // Atomic 语义：一旦标记就不再提交文字
+    private final AtomicBoolean mCompletionClaimed = new AtomicBoolean();
     private volatile boolean mFinalized; // 收到最终结果（可能有 AI 润色版跟随）
     private volatile String mRawText;      // 第1次 onFinal 的原始识别文本
     private Runnable mCommitTimer;       // 延时 commit 兜底
     private InputMethodService mService;
-    private IBinder mRemote;
+    private volatile IBinder mRemote;
     private ServiceConnection mConnection;
     private boolean mBound;
-    private int mSessionId = -1;
-    private int mCurrentState = STATE_IDLE;
+    private volatile int mSessionId = -1;
+    private volatile int mCurrentState = STATE_IDLE;
     private Thread mAudioThread;
-    private AudioRecord mAudioRecord;
-    private boolean mHasPcmFrame;
+    private volatile AudioRecord mAudioRecord;
+    private volatile boolean mHasPcmFrame;
 
     private final Handler mMainHandler = new Handler(Looper.getMainLooper());
     private WeakReference<InputConnection> mInputConnectionRef;
     private Runnable mOnDone;              // 强引用（原 WeakReference 易被 GC 导致波形无法复位）
     private AmplitudeListener mAmpListener;
+
+    private static final class AudioCapture {
+        final Thread thread;
+        final AudioRecord record;
+
+        AudioCapture(Thread thread, AudioRecord record) {
+            this.thread = thread;
+            this.record = record;
+        }
+    }
 
     /** 设置振幅回调（UI 更新） */
     public void setAmplitudeListener(AmplitudeListener l) {
@@ -90,6 +102,10 @@ public class VoiceInputClient {
         mService = service;
         mHolding = true;
         mConsumed = false;
+        mCompletionClaimed.set(false);
+        mFinalized = false;
+        mRawText = null;
+        mHasPcmFrame = false;
         mInputConnectionRef = new WeakReference<>(ic);
         mOnDone = onDone;
 
@@ -137,53 +153,9 @@ public class VoiceInputClient {
                                         if (text == null) text = "";
                                         final String t = text;
 
-                                        if (mConsumed) return true;
-
-                                        if (!mFinalized) {
-                                            // === 第1次 onFinal：原始识别文本 ===
-                                            mFinalized = true;
-                                            mRawText = t;
-                                            // 设 composing 但不 commit，等待 AI 润色版
-                                            mMainHandler.post(() -> {
-                                                if (mConsumed) return;
-                                                InputConnection icL = mInputConnectionRef != null
-                                                        ? mInputConnectionRef.get() : null;
-                                                if (icL != null) icL.setComposingText(t, 1);
-                                            });
-                                            // 延时 commit 兜底：800ms 内没收到润色版就提交原始结果
-                                            mCommitTimer = () -> {
-                                                if (mConsumed) return;
-                                                mConsumed = true;
-                                                mCommitTimer = null;
-                                                InputConnection icL = mInputConnectionRef != null
-                                                        ? mInputConnectionRef.get() : null;
-                                                if (icL != null) {
-                                                    icL.commitText(mRawText != null ? mRawText : t, 1);
-                                                }
-                                                Runnable done = mOnDone;
-                                                if (done != null) done.run();
-                                                doUnbind();
-                                            };
-                                            mMainHandler.postDelayed(mCommitTimer, 800);
-                                        } else {
-                                            // === 第2次 onFinal：AI 润色版 ===
-                                            // 取消兜底定时器，直接用润色文本替换 composing 并 commit
-                                            if (mCommitTimer != null) {
-                                                mMainHandler.removeCallbacks(mCommitTimer);
-                                                mCommitTimer = null;
-                                            }
-                                            mConsumed = true;
-                                            mMainHandler.post(() -> {
-                                                InputConnection icL = mInputConnectionRef != null
-                                                        ? mInputConnectionRef.get() : null;
-                                                if (icL != null) {
-                                                    icL.commitText(t, 1);
-                                                }
-                                                Runnable done = mOnDone;
-                                                if (done != null) done.run();
-                                            });
-                                            doUnbind();
-                                        }
+                                        // Binder 回调可并发；全部交给主线程串行处理，确保第 2 个
+                                        // onFinal 一定能取消第 1 个结果的延时提交。
+                                        mMainHandler.post(() -> handleFinalResult(t));
                                         if (reply != null) reply.writeNoException();
                                         return true;
                                     }
@@ -193,14 +165,12 @@ public class VoiceInputClient {
                                         int errCode = data.readInt();
                                         String msg = data.readString();
                                         Log.w(TAG, "ASR error: " + errCode + " " + msg);
+                                        if (mConsumed) {
+                                            if (reply != null) reply.writeNoException();
+                                            return true;
+                                        }
                                         showToast("语音识别错误: " + (msg != null ? msg : "code=" + errCode));
-                                        if (mConsumed) return true;
-                                        mConsumed = true;
-                                        mMainHandler.post(() -> {
-                                            Runnable done = mOnDone;
-                                            if (done != null) done.run();
-                                        });
-                                        doUnbind();
+                                        completeWithoutResult();
                                         if (reply != null) reply.writeNoException();
                                         return true;
                                     }
@@ -249,7 +219,7 @@ public class VoiceInputClient {
                     if (sid <= 0) {
                         Log.w(TAG, "startPcmSession returned " + sid);
                         showToast("bibi 会话启动失败 (code=" + sid + ")");
-                        doUnbind();
+                        completeWithoutResult();
                     } else {
                         mSessionId = sid;
                         mCurrentState = STATE_RECORDING;
@@ -258,13 +228,14 @@ public class VoiceInputClient {
                 } catch (Throwable t) {
                     Log.w(TAG, "bind/start failed", t);
                     showToast("无法连接 bibi keyboard 服务");
-                    doUnbind();
+                    completeWithoutResult();
                 }
             }
 
             @Override
             public void onServiceDisconnected(ComponentName name) {
-                doUnbind();
+                Log.w(TAG, "speech service disconnected");
+                completeWithoutResult();
             }
         };
         mConnection = conn;
@@ -281,23 +252,24 @@ public class VoiceInputClient {
             Intent intent = new Intent().setComponent(c);
             try {
                 anyBound = service.bindService(intent, conn, Context.BIND_AUTO_CREATE);
-                if (anyBound) break;
+                if (anyBound) {
+                    // 立刻标记，避免极快的连接/取消回调落在循环末尾赋值之前。
+                    mBound = true;
+                    break;
+                }
             } catch (Throwable t) {
                 Log.d(TAG, "bind attempt failed: " + c.getPackageName(), t);
             }
         }
-        mBound = anyBound;
-
         if (!anyBound) {
             showToast("未找到 bibi keyboard");
-            fireOnDone();
-            doUnbind();
+            completeWithoutResult();
         }
     }
 
     /**
      * 停止语音识别（松开按钮时调用）。
-     * 先 finishPcm 告诉服务端处理音频 → 再停录音线程。
+     * 先停录音线程 → 再 finishPcm 告诉服务端处理音频。
      */
     public void stopVoiceInput() {
         if (!mHolding || mConsumed) return;
@@ -305,8 +277,7 @@ public class VoiceInputClient {
 
         if (mCurrentState == STATE_IDLE) {
             Log.d(TAG, "stopVoiceInput: still binding, cancel");
-            fireOnDone();
-            doUnbind();
+            completeWithoutResult();
             return;
         }
 
@@ -314,8 +285,7 @@ public class VoiceInputClient {
         if (mHasPcmFrame) {
             finishSession();
         } else {
-            cancelSession();
-            stopAudioStreaming();
+            completeWithoutResult();
         }
     }
 
@@ -324,23 +294,18 @@ public class VoiceInputClient {
      * 设置 mConsumed 后所有回调都不会提交文字。
      */
     public void cancel() {
-        if (mConsumed) return;
-        mConsumed = true;
-        mHolding = false;
-        doUnbind();
-        stopAudioStreaming();
-        fireOnDone();
+        completeWithoutResult();
     }
 
     // ── 音频流 ──
 
     private void startAudioStreaming() {
-        if (mService.checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+        InputMethodService service = mService;
+        if (service == null || service.checkSelfPermission(Manifest.permission.RECORD_AUDIO)
                 != PackageManager.PERMISSION_GRANTED) {
             Log.w(TAG, "缺少 RECORD_AUDIO 权限");
             showToast("需要麦克风权限");
-            fireOnDone();
-            doUnbind();
+            completeWithoutResult();
             return;
         }
 
@@ -351,75 +316,105 @@ public class VoiceInputClient {
             int minBuf = AudioRecord.getMinBufferSize(sr, ch, fmt);
             int chunkBytes = (sr * 200 / 1000) * 2;
             int bufSize = Math.max(minBuf, chunkBytes * 2);
+            AudioRecord rec = null;
 
-            AudioRecord rec;
             try {
-                rec = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                        sr, ch, fmt, bufSize);
-                rec.startRecording();
-            } catch (Throwable t) {
-                Log.w(TAG, "AudioRecord failed", t);
                 try {
+                    rec = new AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION,
+                            sr, ch, fmt, bufSize);
+                    rec.startRecording();
+                } catch (Throwable first) {
+                    releaseAudioRecord(rec);
+                    rec = null;
+                    Log.w(TAG, "VOICE_RECOGNITION AudioRecord failed", first);
                     rec = new AudioRecord(MediaRecorder.AudioSource.MIC,
                             sr, ch, fmt, bufSize);
                     rec.startRecording();
-                } catch (Throwable e) {
-                    Log.e(TAG, "AudioRecord both failed", e);
-                    showToast("录音启动失败");
-                    fireOnDone();
-                    doUnbind();
-                    return;
+                }
+                mAudioRecord = rec;
+                if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
+                    throw new IllegalStateException("AudioRecord not initialized");
+                }
+
+                byte[] chunk = new byte[chunkBytes];
+                boolean notified = false;
+                boolean streamFailed = false;
+                while (!Thread.currentThread().isInterrupted()
+                        && mSessionId > 0 && mRemote != null && !mConsumed && mHolding) {
+                    int n;
+                    try {
+                        n = rec.read(chunk, 0, chunk.length);
+                    } catch (Throwable t) {
+                        Log.w(TAG, "AudioRecord.read failed", t);
+                        streamFailed = true;
+                        break;
+                    }
+                    if (n < 0) {
+                        streamFailed = true;
+                        break;
+                    }
+                    if (n == 0) {
+                        try { Thread.sleep(10); } catch (InterruptedException e) { break; }
+                        continue;
+                    }
+                    if (!notified) {
+                        notified = true;
+                        Log.d(TAG, "audio streaming started");
+                    }
+                    writePcmFrame(chunk, n, sr, 1);
+                    AmplitudeListener listener = mAmpListener;
+                    if (listener != null) listener.onAmplitude(computeRmsAmplitude(chunk, n));
+                }
+                if (streamFailed && !mConsumed) completeWithoutResult();
+            } catch (Throwable t) {
+                Log.e(TAG, "audio streaming failed", t);
+                if (!mConsumed) completeWithoutResult();
+            } finally {
+                if (mAudioRecord == rec) {
+                    mAudioRecord = null;
+                    releaseAudioRecord(rec);
                 }
             }
-            mAudioRecord = rec;
-
-            byte[] chunk = new byte[chunkBytes];
-            boolean notified = false;
-            long silentChunks = 0;
-
-            while (!Thread.currentThread().isInterrupted()
-                    && mSessionId > 0 && mRemote != null && !mConsumed) {
-
-                if (!mHolding) break;  // 松手立刻退
-
-                int n;
-                try {
-                    n = rec.read(chunk, 0, chunk.length);
-                } catch (Throwable t) {
-                    break;
-                }
-                if (n < 0) break;
-                if (n == 0) {
-                    try { Thread.sleep(10); } catch (InterruptedException e) { break; }
-                    continue;
-                }
-                if (!notified) {
-                    notified = true;
-                    Log.d(TAG, "audio streaming started");
-                }
-                // 计算 RMS 振幅并回调
-                writePcmFrame(chunk, n, sr, 1);
-                if (mAmpListener != null) {
-                    float amp = computeRmsAmplitude(chunk, n);
-                    mAmpListener.onAmplitude(amp);
-                }
-                silentChunks = 0;
-            }
-        });
+        }, "Fcitx5Enh-Audio");
         mAudioThread.setDaemon(true);
         mAudioThread.start();
     }
 
-    private void stopAudioStreaming() {
-        if (mAudioThread != null) {
-            mAudioThread.interrupt();
-            mAudioThread = null;
+    private AudioCapture stopAudioStreaming() {
+        Thread thread = mAudioThread;
+        mAudioThread = null;
+        AudioRecord record = mAudioRecord;
+        mAudioRecord = null;
+
+        if (record != null) {
+            try { record.stop(); } catch (Throwable ignored) {}
         }
-        if (mAudioRecord != null) {
-            try { mAudioRecord.stop(); } catch (Throwable ignored) {}
-            try { mAudioRecord.release(); } catch (Throwable ignored) {}
-            mAudioRecord = null;
+        if (thread != null) thread.interrupt();
+        return new AudioCapture(thread, record);
+    }
+
+    private static void awaitAudioCapture(AudioCapture capture) {
+        if (capture == null) return;
+        if (capture.thread != null && capture.thread != Thread.currentThread()) {
+            try {
+                capture.thread.join(1000);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
+        releaseAudioRecord(capture.record);
+    }
+
+    private static void runSessionTask(Runnable task) {
+        Thread worker = new Thread(task, "Fcitx5Enh-VoiceSession");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    private static void releaseAudioRecord(AudioRecord record) {
+        if (record == null) return;
+        try { record.stop(); } catch (Throwable ignored) {}
+        try { record.release(); } catch (Throwable ignored) {}
     }
 
     private void writePcmFrame(byte[] buf, int len, int sr, int ch) {
@@ -450,35 +445,47 @@ public class VoiceInputClient {
 
     // ── 会话控制 ──
 
-    /** 先停录音 → 再 finishPcm（确保 finishPcm 到达前所有 chunk 已发出） */
+    /** 先停录音并等待音频线程，再在后台发送 finishPcm。 */
     private void finishSession() {
-        if (mRemote == null || mSessionId <= 0) return;
-        // 第一步：停录音线程（确保不再写 PCM）
-        stopAudioStreaming();
-        // 第二步：发 finishPcm（服务端开始处理完整音频）
-        Parcel data = Parcel.obtain();
-        Parcel reply = Parcel.obtain();
-        try {
-            data.writeInterfaceToken(DESCRIPTOR_SVC);
-            data.writeInt(mSessionId);
-            mRemote.transact(TRANSACTION_finishPcm, data, reply, 0);
-            reply.readException();
-        } catch (Throwable t) {
-            Log.w(TAG, "finishSession failed", t);
-        } finally {
-            try { data.recycle(); } catch (Throwable ignored) {}
-            try { reply.recycle(); } catch (Throwable ignored) {}
-        }
+        IBinder remote = mRemote;
+        int sessionId = mSessionId;
+        AudioCapture capture = stopAudioStreaming();
+        runSessionTask(() -> {
+            awaitAudioCapture(capture);
+            // ACTION_CANCEL / detach may have completed the session while the audio thread stopped.
+            if (mCompletionClaimed.get() || mConsumed) return;
+            if (remote == null || sessionId <= 0) {
+                completeWithoutResult();
+                return;
+            }
+
+            Parcel data = Parcel.obtain();
+            Parcel reply = Parcel.obtain();
+            try {
+                data.writeInterfaceToken(DESCRIPTOR_SVC);
+                data.writeInt(sessionId);
+                remote.transact(TRANSACTION_finishPcm, data, reply, 0);
+                reply.readException();
+            } catch (Throwable t) {
+                Log.w(TAG, "finishSession failed", t);
+                completeWithoutResult();
+            } finally {
+                try { data.recycle(); } catch (Throwable ignored) {}
+                try { reply.recycle(); } catch (Throwable ignored) {}
+            }
+        });
     }
 
     private void cancelSession() {
-        if (mRemote == null || mSessionId <= 0) return;
+        IBinder remote = mRemote;
+        int sessionId = mSessionId;
+        if (remote == null || sessionId <= 0) return;
         Parcel data = Parcel.obtain();
         Parcel reply = Parcel.obtain();
         try {
             data.writeInterfaceToken(DESCRIPTOR_SVC);
-            data.writeInt(mSessionId);
-            mRemote.transact(TRANSACTION_cancelSession, data, reply, 0);
+            data.writeInt(sessionId);
+            remote.transact(TRANSACTION_cancelSession, data, reply, 0);
             reply.readException();
         } catch (Throwable t) {
             Log.w(TAG, "cancelSession failed", t);
@@ -503,21 +510,79 @@ public class VoiceInputClient {
         mHasPcmFrame = false;
     }
 
-    private void fireOnDone() {
+    /** 主线程上串行处理最终识别结果，防止 Binder 回调并发导致定时器漏取消。 */
+    private void handleFinalResult(String text) {
+        if (mConsumed) return;
+
+        if (claimFirstFinal(text)) {
+            // 第 1 个结果：先作为 composing 显示，给 AI 润色结果最多 800ms 的替换窗口。
+            InputConnection ic = mInputConnectionRef != null ? mInputConnectionRef.get() : null;
+            if (ic != null) ic.setComposingText(text, 1);
+            mCommitTimer = () -> {
+                if (!claimCompletion()) return;
+                mCommitTimer = null;
+                InputConnection timerIc = mInputConnectionRef != null ? mInputConnectionRef.get() : null;
+                if (timerIc != null) timerIc.commitText(mRawText != null ? mRawText : text, 1);
+                Runnable done = mOnDone;
+                if (done != null) done.run();
+                doUnbind();
+            };
+            mMainHandler.postDelayed(mCommitTimer, 800);
+            return;
+        }
+
+        // 第 2 个结果：AI 润色版，取消原始结果的兜底提交后立即提交。
+        if (mCommitTimer != null) {
+            mMainHandler.removeCallbacks(mCommitTimer);
+            mCommitTimer = null;
+        }
+        if (!claimCompletion()) return;
+        InputConnection ic = mInputConnectionRef != null ? mInputConnectionRef.get() : null;
+        if (ic != null) ic.commitText(text, 1);
+        Runnable done = mOnDone;
+        if (done != null) done.run();
+        doUnbind();
+    }
+
+    private synchronized boolean claimFirstFinal(String text) {
+        if (mFinalized) return false;
+        mFinalized = true;
+        mRawText = text;
+        return true;
+    }
+
+    private boolean claimCompletion() {
+        if (!mCompletionClaimed.compareAndSet(false, true)) return false;
+        mConsumed = true;
+        return true;
+    }
+
+    private void completeWithoutResult() {
+        if (!claimCompletion()) return;
+        mHolding = false;
+        // mCommitTimer 仅在主线程创建/访问，避免与 Binder 回调竞争。
         mMainHandler.post(() -> {
-            if (mConsumed) return;
-            mConsumed = true;
-            Runnable done = mOnDone;
-            if (done != null) done.run();
+            if (mCommitTimer != null) {
+                mMainHandler.removeCallbacks(mCommitTimer);
+                mCommitTimer = null;
+            }
+        });
+        AudioCapture capture = stopAudioStreaming();
+        runSessionTask(() -> {
+            awaitAudioCapture(capture);
+            cancelSession();
+            mMainHandler.post(() -> {
+                doUnbind();
+                Runnable done = mOnDone;
+                if (done != null) done.run();
+            });
         });
     }
 
     private void showToast(String msg) {
-        mMainHandler.post(() -> {
-            if (mService != null) {
-                Toast.makeText(mService, msg, Toast.LENGTH_SHORT).show();
-            }
-        });
+        final InputMethodService service = mService;
+        if (service == null) return;
+        mMainHandler.post(() -> Toast.makeText(service, msg, Toast.LENGTH_SHORT).show());
     }
 
     /** 从 PCM 16bit 数据计算 RMS 归一化振幅 */

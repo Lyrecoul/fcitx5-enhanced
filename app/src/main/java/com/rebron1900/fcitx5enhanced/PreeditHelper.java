@@ -1,5 +1,6 @@
 package com.rebron1900.fcitx5enhanced;
 
+import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.util.Log;
 import android.util.TypedValue;
@@ -22,7 +23,32 @@ import java.lang.reflect.Method;
 public class PreeditHelper {
     private static final String TAG = "Fcitx5Enh";
 
-    private static View mRegisteredView;  // 跟踪 listener 注册到哪个 view
+    private static java.lang.ref.WeakReference<View> mRegisteredViewRef;  // 跟踪 listener 注册到哪个 view（弱引用防泄漏）
+
+    private static final class LayoutState {
+        final int width;
+        final int leftMargin, rightMargin, bottomMargin;
+        final Integer endToEnd, rightToRight, startToStart;
+        final Float horizontalBias;
+
+        LayoutState(ViewGroup.LayoutParams lp) {
+            width = lp.width;
+            int left = 0, right = 0, bottom = 0;
+            if (lp instanceof ViewGroup.MarginLayoutParams) {
+                ViewGroup.MarginLayoutParams margins = (ViewGroup.MarginLayoutParams) lp;
+                left = margins.leftMargin;
+                right = margins.rightMargin;
+                bottom = margins.bottomMargin;
+            }
+            leftMargin = left;
+            rightMargin = right;
+            bottomMargin = bottom;
+            endToEnd = getIntField(lp, "endToEnd");
+            rightToRight = getIntField(lp, "rightToRight");
+            startToStart = getIntField(lp, "startToStart");
+            horizontalBias = getFloatField(lp, "horizontalBias");
+        }
+    }
 
     public static void apply(View inputView, MainHook.Config c, MainHook.ThemeInfo ti) {
         try {
@@ -31,6 +57,11 @@ public class PreeditHelper {
             View preeditRoot = findPreeditRoot(inputView);
             if (preeditRoot == null) {
                 Log.w(TAG, "preedit root not found");
+                return;
+            }
+
+            if (c.corner <= 0) {
+                restorePreeditState(preeditRoot);
                 return;
             }
 
@@ -43,6 +74,7 @@ public class PreeditHelper {
             final float leftMarginPx = 12 * den;
             final float bottomMarginPx = 3 * den;
 
+            rememberPreeditState(preeditRoot);
             // 子 View 清 background → 透出底层背景
             if (preeditRoot instanceof ViewGroup) {
                 ViewGroup vg = (ViewGroup) preeditRoot;
@@ -60,8 +92,8 @@ public class PreeditHelper {
             preeditRoot.setBackground(gd);
 
             // 注册一次 listener：检测宽度/约束变化时用 post {} 修正
-            if (mRegisteredView != preeditRoot) {
-                mRegisteredView = preeditRoot;
+            if (mRegisteredViewRef == null || mRegisteredViewRef.get() != preeditRoot) {
+                mRegisteredViewRef = new java.lang.ref.WeakReference<>(preeditRoot);
                 preeditRoot.addOnLayoutChangeListener((v, l, t, r1, b, ol, ot, or, ob) -> {
                     ViewGroup.LayoutParams lp = v.getLayoutParams();
                     if (lp == null) return;
@@ -113,6 +145,7 @@ public class PreeditHelper {
                 return;
             }
 
+            rememberLayoutState(v, lp);
             lp.width = ViewGroup.LayoutParams.WRAP_CONTENT;
 
             // 清除 end 约束，强制靠左
@@ -136,6 +169,93 @@ public class PreeditHelper {
         } catch (Exception e) {
             Log.w(TAG, "preedit fixLayout: " + e);
         }
+    }
+
+    private static void rememberPreeditState(View root) {
+        if (!Boolean.TRUE.equals(root.getTag(R.id.tag_preedit_state_saved))) {
+            root.setTag(R.id.tag_preedit_state_saved, Boolean.TRUE);
+            root.setTag(R.id.tag_original_preedit_background, root.getBackground());
+        }
+        if (root instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) root;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                View child = group.getChildAt(i);
+                // 键盘切换时 root 可复用但内部 child 会重建；新 child 也要保存一次。
+                if (!Boolean.TRUE.equals(child.getTag(R.id.tag_preedit_state_saved))) {
+                    child.setTag(R.id.tag_preedit_state_saved, Boolean.TRUE);
+                    child.setTag(R.id.tag_original_preedit_background, child.getBackground());
+                }
+            }
+        }
+    }
+
+    private static void restorePreeditState(View root) {
+        if (!Boolean.TRUE.equals(root.getTag(R.id.tag_preedit_state_saved))) return;
+        restoreBackground(root);
+        restoreLayoutState(root);
+        if (root instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) root;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                View child = group.getChildAt(i);
+                if (Boolean.TRUE.equals(child.getTag(R.id.tag_preedit_state_saved))) {
+                    restoreBackground(child);
+                    child.setTag(R.id.tag_preedit_state_saved, null);
+                }
+            }
+        }
+        root.setTag(R.id.tag_preedit_state_saved, null);
+        Log.i(TAG, "preedit state restored");
+    }
+
+    private static void restoreBackground(View view) {
+        Object original = view.getTag(R.id.tag_original_preedit_background);
+        view.setBackground(original instanceof Drawable ? (Drawable) original : null);
+        view.setTag(R.id.tag_original_preedit_background, null);
+    }
+
+    private static void rememberLayoutState(View view, ViewGroup.LayoutParams lp) {
+        if (view.getTag(R.id.tag_original_preedit_layout) == null) {
+            view.setTag(R.id.tag_original_preedit_layout, new LayoutState(lp));
+        }
+    }
+
+    private static void restoreLayoutState(View view) {
+        Object stateObject = view.getTag(R.id.tag_original_preedit_layout);
+        if (!(stateObject instanceof LayoutState)) return;
+        LayoutState state = (LayoutState) stateObject;
+        ViewGroup.LayoutParams lp = view.getLayoutParams();
+        if (lp == null) return;
+        lp.width = state.width;
+        if (lp instanceof ViewGroup.MarginLayoutParams) {
+            ViewGroup.MarginLayoutParams margins = (ViewGroup.MarginLayoutParams) lp;
+            margins.leftMargin = state.leftMargin;
+            margins.rightMargin = state.rightMargin;
+            margins.bottomMargin = state.bottomMargin;
+        }
+        setIntField(lp, "endToEnd", state.endToEnd);
+        setIntField(lp, "rightToRight", state.rightToRight);
+        setIntField(lp, "startToStart", state.startToStart);
+        setFloatField(lp, "horizontalBias", state.horizontalBias);
+        view.setTag(R.id.tag_original_preedit_layout, null);
+        view.requestLayout();
+    }
+
+    private static Integer getIntField(Object target, String name) {
+        try { return target.getClass().getField(name).getInt(target); } catch (Exception ignored) { return null; }
+    }
+
+    private static Float getFloatField(Object target, String name) {
+        try { return target.getClass().getField(name).getFloat(target); } catch (Exception ignored) { return null; }
+    }
+
+    private static void setIntField(Object target, String name, Integer value) {
+        if (value == null) return;
+        try { target.getClass().getField(name).setInt(target, value); } catch (Exception ignored) {}
+    }
+
+    private static void setFloatField(Object target, String name, Float value) {
+        if (value == null) return;
+        try { target.getClass().getField(name).setFloat(target, value); } catch (Exception ignored) {}
     }
 
     /** 从 preeditRoot 向上找 InputView */

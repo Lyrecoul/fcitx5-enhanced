@@ -29,6 +29,4 @@ android {
 dependencies {
     compileOnly(files("libs/xposed-api-101.0.1.jar"))
     implementation("com.caverock:androidsvg:1.4")
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("androidx.work:work-runtime:2.10.1")
 }

@@ -10,17 +10,26 @@ import android.util.Log;
 
 /**
  * 跨进程配置共享 Provider。
- * <p>
- * SettingsActivity（插件进程）写入 → fcitx5 进程通过 ContentObserver 感知变化 → 读取。
+ *
+ * 模块进程负责持久化，目标输入法进程只通过 query/ContentObserver 访问。
+ * Provider 必须 exported，调用方白名单负责避免其他应用篡改配置。
  */
 public class ConfigProvider extends ContentProvider {
-
     private static final String TAG = "Fcitx5Enh";
-    private static final String SP_NAME = "fcitx5_enhanced_config_provider";
+    private static final String[] COLUMNS = {
+            ConfigContract.SHOW_LEFT_BUTTON,
+            ConfigContract.SHOW_RIGHT_BUTTON,
+            ConfigContract.VOICE_ENABLED,
+            ConfigContract.KEY_BORDER,
+            ConfigContract.BLUR_RADIUS,
+            ConfigContract.BG_ALPHA,
+            ConfigContract.KEY_ALPHA,
+            ConfigContract.CORNER_RADIUS
+    };
 
     @Override
     public boolean onCreate() {
-        return true;
+        return getContext() != null;
     }
 
     @Override
@@ -28,68 +37,166 @@ public class ConfigProvider extends ContentProvider {
         return "vnd.android.cursor.dir/vnd.fcitx5enhanced.config";
     }
 
-    /** SettingsActivity 写入配置。 */
+    /** 仅允许模块 SettingsActivity 写入。 */
     @Override
     public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
-        Log.i(TAG, "ConfigProvider.write config");
+        requireValidUri(uri);
+        if (!isModuleCaller()) {
+            throw new SecurityException("config update is only available to the module");
+        }
+        if (values == null || values.size() == 0) return 0;
+
         try {
-            SharedPreferences sp = getContext()
-                    .getSharedPreferences(SP_NAME, android.content.Context.MODE_PRIVATE);
-            SharedPreferences.Editor ed = sp.edit();
-            writeBool(ed, values, "show_left_button", true);
-            writeBool(ed, values, "show_right_button", true);
-            writeBool(ed, values, "voice_enabled", true);
-            writeBool(ed, values, "key_border", true);
-            writeInt(ed, values, "blur_radius", 100);
-            writeInt(ed, values, "bg_alpha", 60);
-            writeInt(ed, values, "key_alpha", 140);
-            writeInt(ed, values, "corner_radius", 20);
-            ed.commit();
-            // 通知观察者
-            getContext().getContentResolver().notifyChange(uri, null);
+            SharedPreferences.Editor editor = preferences().edit();
+            putBoolean(editor, values, ConfigContract.SHOW_LEFT_BUTTON);
+            putBoolean(editor, values, ConfigContract.SHOW_RIGHT_BUTTON);
+            putBoolean(editor, values, ConfigContract.VOICE_ENABLED);
+            putBoolean(editor, values, ConfigContract.KEY_BORDER);
+            putInt(editor, values, ConfigContract.BLUR_RADIUS);
+            putInt(editor, values, ConfigContract.BG_ALPHA);
+            putInt(editor, values, ConfigContract.KEY_ALPHA);
+            putInt(editor, values, ConfigContract.CORNER_RADIUS);
+
+            if (!editor.commit()) {
+                Log.w(TAG, "ConfigProvider.write commit returned false");
+                return 0;
+            }
+            getContext().getContentResolver().notifyChange(ConfigContract.CONTENT_URI, null);
+            Log.i(TAG, "ConfigProvider.write config");
             return 1;
         } catch (Exception e) {
-            Log.w(TAG, "ConfigProvider.write failed: " + e);
+            Log.w(TAG, "ConfigProvider.write failed", e);
             return 0;
         }
     }
 
-    /** MainHook 读取配置。返回单行 Cursor。 */
+    /** 目标输入法进程读取单行、整型布尔值 Cursor。 */
     @Override
     public Cursor query(Uri uri, String[] projection, String selection,
                         String[] selectionArgs, String sortOrder) {
-        try {
-            SharedPreferences sp = getContext()
-                    .getSharedPreferences(SP_NAME, android.content.Context.MODE_PRIVATE);
-            MatrixCursor c = new MatrixCursor(new String[]{
-                    "show_left_button", "show_right_button", "voice_enabled",
-                    "key_border", "blur_radius", "bg_alpha", "key_alpha", "corner_radius"
-            });
-            c.addRow(new Object[]{
-                    sp.getBoolean("show_left_button", true),
-                    sp.getBoolean("show_right_button", true),
-                    sp.getBoolean("voice_enabled", true),
-                    sp.getBoolean("key_border", true),
-                    sp.getInt("blur_radius", 100),
-                    sp.getInt("bg_alpha", 60),
-                    sp.getInt("key_alpha", 140),
-                    sp.getInt("corner_radius", 20)
-            });
-            return c;
-        } catch (Exception e) {
-            Log.w(TAG, "ConfigProvider.read failed: " + e);
-            return null;
+        requireValidUri(uri);
+        if (!isAllowedReader()) {
+            throw new SecurityException("config query is not available to this caller");
+        }
+
+        SharedPreferences sp = preferences();
+        MatrixCursor cursor = new MatrixCursor(COLUMNS);
+        cursor.addRow(new Object[]{
+                sp.getBoolean(ConfigContract.SHOW_LEFT_BUTTON, ConfigContract.DEFAULT_LEFT_BUTTON) ? 1 : 0,
+                sp.getBoolean(ConfigContract.SHOW_RIGHT_BUTTON, ConfigContract.DEFAULT_RIGHT_BUTTON) ? 1 : 0,
+                sp.getBoolean(ConfigContract.VOICE_ENABLED, ConfigContract.DEFAULT_VOICE) ? 1 : 0,
+                sp.getBoolean(ConfigContract.KEY_BORDER, ConfigContract.DEFAULT_KEY_BORDER) ? 1 : 0,
+                sp.getInt(ConfigContract.BLUR_RADIUS, ConfigContract.DEFAULT_BLUR),
+                sp.getInt(ConfigContract.BG_ALPHA, ConfigContract.DEFAULT_ALPHA),
+                sp.getInt(ConfigContract.KEY_ALPHA, ConfigContract.DEFAULT_KEY_ALPHA),
+                sp.getInt(ConfigContract.CORNER_RADIUS, ConfigContract.DEFAULT_CORNER)
+        });
+        return cursor;
+    }
+
+    private SharedPreferences preferences() {
+        migrateLegacyActivityPreferences();
+        return rawPreferences();
+    }
+
+    private SharedPreferences rawPreferences() {
+        return getContext().getSharedPreferences(
+                ConfigContract.PREFS_NAME, android.content.Context.MODE_PRIVATE);
+    }
+
+    /**
+     * 旧版设置页使用 Activity.getPreferences()；Provider 首次访问时就迁移，
+     * 避免用户升级后必须先打开设置页才能恢复已有配置。
+     */
+    private synchronized void migrateLegacyActivityPreferences() {
+        SharedPreferences target = rawPreferences();
+        if (target.contains(ConfigContract.BLUR_RADIUS)) return;
+
+        // Android Activity.getLocalClassName() 在不同实现中可能保留或省略开头的点。
+        String[] legacyNames = {
+                ".SettingsActivity",
+                "SettingsActivity",
+                "com.rebron1900.fcitx5enhanced.SettingsActivity"
+        };
+        for (String name : legacyNames) {
+            SharedPreferences legacy = getContext().getSharedPreferences(
+                    name, android.content.Context.MODE_PRIVATE);
+            if (!legacy.contains(ConfigContract.BLUR_RADIUS)) continue;
+
+            boolean migrated = target.edit()
+                    .putInt(ConfigContract.BLUR_RADIUS,
+                            legacy.getInt(ConfigContract.BLUR_RADIUS, ConfigContract.DEFAULT_BLUR))
+                    .putInt(ConfigContract.BG_ALPHA,
+                            legacy.getInt(ConfigContract.BG_ALPHA, ConfigContract.DEFAULT_ALPHA))
+                    .putInt(ConfigContract.KEY_ALPHA,
+                            legacy.getInt(ConfigContract.KEY_ALPHA, ConfigContract.DEFAULT_KEY_ALPHA))
+                    .putInt(ConfigContract.CORNER_RADIUS,
+                            legacy.getInt(ConfigContract.CORNER_RADIUS, ConfigContract.DEFAULT_CORNER))
+                    .putBoolean(ConfigContract.VOICE_ENABLED,
+                            legacy.getBoolean(ConfigContract.VOICE_ENABLED, ConfigContract.DEFAULT_VOICE))
+                    .putBoolean(ConfigContract.SHOW_LEFT_BUTTON,
+                            legacy.getBoolean(ConfigContract.SHOW_LEFT_BUTTON,
+                                    ConfigContract.DEFAULT_LEFT_BUTTON))
+                    .putBoolean(ConfigContract.SHOW_RIGHT_BUTTON,
+                            legacy.getBoolean(ConfigContract.SHOW_RIGHT_BUTTON,
+                                    ConfigContract.DEFAULT_RIGHT_BUTTON))
+                    .putBoolean(ConfigContract.KEY_BORDER,
+                            legacy.getBoolean(ConfigContract.KEY_BORDER,
+                                    ConfigContract.DEFAULT_KEY_BORDER))
+                    .commit();
+            if (migrated) Log.i(TAG, "migrated legacy activity preferences");
+            return;
         }
     }
 
-    // helper
-    private void writeBool(SharedPreferences.Editor ed, ContentValues v, String key, boolean def) {
-        if (v.containsKey(key)) ed.putBoolean(key, v.getAsBoolean(key));
-        else ed.putBoolean(key, def);
+    private void requireValidUri(Uri uri) {
+        if (!ConfigContract.CONTENT_URI.equals(uri)) {
+            throw new IllegalArgumentException("unsupported config URI: " + uri);
+        }
     }
-    private void writeInt(SharedPreferences.Editor ed, ContentValues v, String key, int def) {
-        if (v.containsKey(key)) ed.putInt(key, v.getAsInteger(key));
-        else ed.putInt(key, def);
+
+    private boolean isModuleCaller() {
+        int uid = android.os.Binder.getCallingUid();
+        return uid == android.os.Process.myUid()
+                || uidHasPackage(uid, getContext().getPackageName());
+    }
+
+    private boolean isAllowedReader() {
+        int uid = android.os.Binder.getCallingUid();
+        return uid == android.os.Process.myUid()
+                || uidHasPackage(uid, "org.fcitx.fcitx5.android")
+                || uidHasPackage(uid, "org.fcitx.fcitx5.android.fx");
+    }
+
+    private boolean uidHasPackage(int uid, String packageName) {
+        String[] packages = getContext().getPackageManager().getPackagesForUid(uid);
+        if (packages == null) return false;
+        for (String pkg : packages) {
+            if (packageName.equals(pkg)) return true;
+        }
+        return false;
+    }
+
+    private static void putBoolean(SharedPreferences.Editor editor, ContentValues values, String key) {
+        if (!values.containsKey(key)) return;
+        Object value = values.get(key);
+        if (value instanceof Boolean) {
+            editor.putBoolean(key, (Boolean) value);
+        } else if (value instanceof Number) {
+            editor.putBoolean(key, ((Number) value).intValue() != 0);
+        } else {
+            editor.putBoolean(key, Boolean.parseBoolean(String.valueOf(value)));
+        }
+    }
+
+    private static void putInt(SharedPreferences.Editor editor, ContentValues values, String key) {
+        if (!values.containsKey(key)) return;
+        Object value = values.get(key);
+        if (value instanceof Number) {
+            editor.putInt(key, ((Number) value).intValue());
+        } else {
+            editor.putInt(key, Integer.parseInt(String.valueOf(value)));
+        }
     }
 
     @Override public Uri insert(Uri uri, ContentValues values) { return null; }

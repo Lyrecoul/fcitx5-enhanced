@@ -9,7 +9,6 @@ import android.graphics.Path;
 import android.graphics.PorterDuff;
 import android.graphics.PorterDuffXfermode;
 import android.graphics.Shader;
-import android.view.MotionEvent;
 import android.view.View;
 
 /**
@@ -27,6 +26,9 @@ public class WaveformLineView extends View {
     private final Paint mLayerPaint;       // 录音态多层波形共用
     private final Paint mMaskPaint;        // 透明度遮罩
     private final Path mPath;
+    private final float[] mWaveY = new float[129];
+    private final float[] mPathFuncs = {1.0f, 0.9f, -0.8f, -1.0f};
+    private final float[] mLayerWidths = new float[4];
 
     private int mIdleColor, mRecColor, mCurColor;
 
@@ -44,7 +46,6 @@ public class WaveformLineView extends View {
 
     private float mPhase = 0f;
     private boolean mRecording = false;
-    private OnTouchListener mListener;
 
     private float mDensity;
 
@@ -104,6 +105,12 @@ public class WaveformLineView extends View {
             mTargetVolume = 0;
         }
         invalidate();
+    }
+
+    @Override
+    public boolean performClick() {
+        super.performClick();
+        return true;
     }
 
     /** 从 AIDL 服务接收归一化振幅 0~1 */
@@ -184,19 +191,20 @@ public class WaveformLineView extends View {
 
         float segW = lineW / mSamplingSize;
 
-        float[] pathFuncs = {1.0f, 0.9f, -0.8f, -1.0f};
-        float[] layerWidths = {strokeW * 0.8f, strokeW * 0.6f, strokeW * 0.5f, strokeW * 0.4f};
+        mLayerWidths[0] = strokeW * 0.8f;
+        mLayerWidths[1] = strokeW * 0.6f;
+        mLayerWidths[2] = strokeW * 0.5f;
+        mLayerWidths[3] = strokeW * 0.4f;
 
         int lr = Color.red(mRecColor), lg = Color.green(mRecColor), lb = Color.blue(mRecColor);
 
-        // 预计算波形值
-        float[] waveY = new float[mSamplingSize + 1];
+        // 预计算波形值到固定容量缓冲区，避免每帧分配数组。
         for (int i = 0; i <= mSamplingSize; i++) {
             float t = (float) i / mSamplingSize;
             double mapX = (t - 0.5) * 4.0;
             double sinVal = Math.sin(Math.PI * mapX - offset * Math.PI);
             double rec = 4.0 / (4.0 + mapX * mapX * mapX * mapX);
-            waveY[i] = (float) (sinVal * rec * maxAmp);
+            mWaveY[i] = (float) (sinVal * rec * maxAmp);
         }
 
         // 用 saveLayer + DST_IN 透明度遮罩实现边缘渐隐
@@ -205,11 +213,11 @@ public class WaveformLineView extends View {
             mPath.reset();
             for (int i = 0; i <= mSamplingSize; i++) {
                 float x = pad + i * segW;
-                float y = cy + waveY[i] * pathFuncs[layer] * volScale;
+                float y = cy + mWaveY[i] * mPathFuncs[layer] * volScale;
                 if (i == 0) mPath.moveTo(x, y);
                 else        mPath.lineTo(x, y);
             }
-            mLayerPaint.setStrokeWidth(layerWidths[layer]);
+            mLayerPaint.setStrokeWidth(mLayerWidths[layer]);
             mLayerPaint.setColor(Color.argb(255, lr, lg, lb));
             mLayerPaint.setShader(null);
             c.drawPath(mPath, mLayerPaint);
@@ -230,14 +238,6 @@ public class WaveformLineView extends View {
             mVolume = mTargetVolume;
         }
     }
-
-    @Override
-    public boolean onTouchEvent(MotionEvent e) {
-        return mListener != null && mListener.onTouch(this, e);
-    }
-
-    @Override
-    public void setOnTouchListener(OnTouchListener l) { mListener = l; }
 
     @Override
     protected void onMeasure(int wSpec, int hSpec) {

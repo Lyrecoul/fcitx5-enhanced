@@ -11,6 +11,8 @@ import android.util.Log;
 
 import com.caverock.androidsvg.SVG;
 
+import java.util.Locale;
+
 /** Lucide SVG icons rendered to BitmapDrawable at runtime. */
 public class SvgIcons {
     private static final String TAG = "Fcitx5Enh";
@@ -29,17 +31,6 @@ public class SvgIcons {
         "<path d=\"M7 16h10\"/>" +
         "</svg>";
 
-    /** Lucide audio-lines.svg — 语音输入图标 */
-    private static final String MIC_SVG =
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"%s\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\">" +
-        "<path d=\"M2 20v-8\"/>" +
-        "<path d=\"M6 20v-4\"/>" +
-        "<path d=\"M10 20V4\"/>" +
-        "<path d=\"M14 20V8\"/>" +
-        "<path d=\"M18 20v-6\"/>" +
-        "<path d=\"M22 20v-2\"/>" +
-        "</svg>";
-
     /** Lucide clipboard-list.svg — 剪贴板图标 */
     private static final String CLIPBOARD_SVG =
         "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"%s\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\">" +
@@ -55,10 +46,6 @@ public class SvgIcons {
         return render(IME_SVG, density, color, sizeDp);
     }
 
-    public static Drawable mic(float density, int color, int sizeDp) {
-        return render(MIC_SVG, density, color, sizeDp);
-    }
-
     public static Drawable clipboard(float density, int color, int sizeDp) {
         return render(CLIPBOARD_SVG, density, color, sizeDp);
     }
@@ -67,8 +54,8 @@ public class SvgIcons {
         try {
             int r = Color.red(color), g = Color.green(color), b = Color.blue(color);
             float a = Color.alpha(color) / 255.0f;
-            String strokeColor = String.format("rgba(%d,%d,%d,%.2f)", r, g, b, a);
-            String svgXml = String.format(svgTemplate, strokeColor);
+            String strokeColor = String.format(Locale.ROOT, "rgba(%d,%d,%d,%.2f)", r, g, b, a);
+            String svgXml = String.format(Locale.ROOT, svgTemplate, strokeColor);
 
             SVG svg = SVG.getFromString(svgXml);
             int px = Math.max(1, (int) (sizeDp * density + 0.5f));

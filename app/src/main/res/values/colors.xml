@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- iOS 风格配色（浅色） -->
+<resources>
+    <color name="ios_grouped_bg">#F2F2F7</color>
+    <color name="ios_card">#FFFFFF</color>
+    <color name="ios_label">#000000</color>
+    <color name="ios_secondary">#8E8E93</color>
+    <color name="ios_separator">#C6C6C8</color>
+    <color name="ios_accent">#007AFF</color>
+</resources>

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- iOS 设置卡片：10dp 圆角 + 卡片底色 -->
+<shape xmlns:android="http://schemas.android.com/apk/res/android">
+    <solid android:color="@color/ios_card" />
+    <corners android:radius="10dp" />
+</shape>
