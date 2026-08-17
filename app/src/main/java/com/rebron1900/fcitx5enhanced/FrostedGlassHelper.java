@@ -50,6 +50,19 @@ public class FrostedGlassHelper {
         }
     }
 
+    /** 保存背景 ImageView 原始 ScaleType，关闭毛玻璃后恢复，避免后续查找失效。 */
+    private static final java.util.WeakHashMap<ImageView, ImageView.ScaleType>
+            sOriginalFrostedScaleTypes = new java.util.WeakHashMap<>();
+    /** 记录本次由 Helper 接管的状态，目标 View 重建 Drawable 后可更新恢复基线。 */
+    private static final java.util.WeakHashMap<ImageView, java.lang.ref.WeakReference<Drawable>>
+            sManagedFrostedBackgrounds = new java.util.WeakHashMap<>();
+    private static final java.util.WeakHashMap<ImageView, java.lang.ref.WeakReference<Drawable>>
+            sManagedFrostedImages = new java.util.WeakHashMap<>();
+    private static final java.util.WeakHashMap<ImageView, java.lang.ref.WeakReference<Drawable>>
+            sManagedFrostedForegrounds = new java.util.WeakHashMap<>();
+    private static final java.util.WeakHashMap<ImageView, ImageView.ScaleType>
+            sManagedFrostedScaleTypes = new java.util.WeakHashMap<>();
+
     /** 键盘前景可能由目标输入法自己使用，描边关闭时恢复原始 foreground。 */
     private static final java.util.WeakHashMap<View, java.lang.ref.WeakReference<Drawable>>
             sOriginalKeyboardForegrounds = new java.util.WeakHashMap<>();
@@ -62,21 +75,23 @@ public class FrostedGlassHelper {
     private static final java.util.WeakHashMap<View, Boolean> sSavedFrostedBackgrounds =
             new java.util.WeakHashMap<>();
 
-    public static void apply(View inputView, MainHook.Config c, MainHook.ThemeInfo ti) {
-        applyFrostedGlass(inputView, c, ti);
-        applyRoundedCorners(inputView, c, ti);
+    public static boolean apply(View inputView, MainHook.Config c, MainHook.ThemeInfo ti) {
+        boolean frostedApplied = applyFrostedGlass(inputView, c, ti);
+        boolean cornersApplied = applyRoundedCorners(inputView, c, ti);
+        return frostedApplied && cornersApplied;
     }
 
     // ══════════════════════════════════════════
     //  毛玻璃 — ViewRootImpl.createBackgroundBlurDrawable()
     // ══════════════════════════════════════════
-    private static void applyFrostedGlass(View inputView, MainHook.Config c, MainHook.ThemeInfo ti) {
+    private static boolean applyFrostedGlass(View inputView, MainHook.Config c, MainHook.ThemeInfo ti) {
         try {
             ImageView bg = findCustomBackground(inputView);
             if (bg == null) {
                 Log.w(TAG, "customBackground ImageView not found");
-                return;
+                return false;
             }
+            refreshFrostedOriginalState(bg);
 
             // 直接用传入的 ThemeInfo，不再反射
             boolean isDark = ti.isDark;
@@ -93,7 +108,7 @@ public class FrostedGlassHelper {
             if (c.blur <= 0) {
                 clearFrostedEffect(bg);
                 Log.i(TAG, "frosted glass disabled");
-                return;
+                return true;
             }
 
             if (viewRootImpl != null) {
@@ -165,22 +180,21 @@ public class FrostedGlassHelper {
                         gt.setBounds(0, 0, w, h);
                         gt.draw(cnv);
                     }
-                    // 回收旧 Bitmap（仅在无自定义背景图时回收）
-                    Drawable oldBg = bg.getDrawable();
+                    // 恢复旧版语义：有自定义图片时降低原图可见度；无图片时直接显示 tint 位图。
+                    Drawable oldImage = bg.getDrawable();
                     boolean isOurTint = Boolean.TRUE.equals(bg.getTag(R.id.tag_frosted_tint));
                     boolean hasCustomImage = !isOurTint
-                            && (oldBg instanceof android.graphics.drawable.BitmapDrawable)
-                            && ((android.graphics.drawable.BitmapDrawable) oldBg).getBitmap() != null;
+                            && (oldImage instanceof android.graphics.drawable.BitmapDrawable)
+                            && ((android.graphics.drawable.BitmapDrawable) oldImage).getBitmap() != null;
 
                     if (hasCustomImage) {
-                        // 用户有自定义背景图：保留原图，叠加半透明遮罩
                         bg.setImageAlpha(Math.max(10, 255 - alpha));
                         bg.setForeground(new android.graphics.drawable.ColorDrawable(
                                 Color.argb(Math.min(255, alpha / 2), 0, 0, 0)));
                         bg.setTag(R.id.tag_frosted_tint, null);
                         Log.i(TAG, "✅ REAL blur=" + c.blur + " alpha=" + alpha + " (custom image preserved)");
                     } else {
-                        // 无自定义背景图：用 tint 位图。不 recycle 旧 bitmap（可能被其他 view 共享），交给 GC
+                        // 不 recycle 旧 Bitmap：可能被其他 View 共享，交给 GC。
                         bg.setImageBitmap(tint);
                         bg.setScaleType(ImageView.ScaleType.FIT_XY);
                         bg.setImageAlpha(255);
@@ -188,17 +202,20 @@ public class FrostedGlassHelper {
                         bg.setTag(R.id.tag_frosted_tint, Boolean.TRUE);
                         Log.i(TAG, "✅ REAL blur=" + c.blur + " alpha=" + alpha + " dark=" + isDark);
                     }
+                    rememberManagedFrostedState(bg, (Drawable) blurDrawable);
+                    return true;
                 } else {
                     Log.w(TAG, "createBackgroundBlurDrawable returned null");
-                    fallback(bg, inputView, isDark, c, keyBgColor);
+                    return fallback(bg, inputView, isDark, c, keyBgColor);
                 }
             } else {
                 Log.w(TAG, "viewRootImpl=" + viewRootImpl + " blur=" + c.blur);
-                fallback(bg, inputView, isDark, c, keyBgColor);
+                return fallback(bg, inputView, isDark, c, keyBgColor);
             }
         } catch (Throwable t) {
             Log.w(TAG, "frosted glass failed: " + t);
         }
+        return false;
     }
 
     private static Bitmap obtainTintBitmap(ImageView bg, int width, int height, int fingerprint) {
@@ -221,6 +238,7 @@ public class FrostedGlassHelper {
         bg.setTag(R.id.tag_original_frosted_drawable, bg.getDrawable());
         bg.setTag(R.id.tag_original_frosted_alpha, bg.getImageAlpha());
         bg.setTag(R.id.tag_original_frosted_foreground, bg.getForeground());
+        sOriginalFrostedScaleTypes.put(bg, bg.getScaleType());
         sSavedFrostedBackgrounds.put(bg, Boolean.TRUE);
     }
 
@@ -235,19 +253,69 @@ public class FrostedGlassHelper {
         bg.setImageDrawable(originalDrawable instanceof Drawable ? (Drawable) originalDrawable : null);
         bg.setImageAlpha(originalAlpha instanceof Integer ? (Integer) originalAlpha : 255);
         bg.setForeground(originalForeground instanceof Drawable ? (Drawable) originalForeground : null);
+        ImageView.ScaleType originalScaleType = sOriginalFrostedScaleTypes.remove(bg);
+        if (originalScaleType != null) bg.setScaleType(originalScaleType);
         bg.setTag(R.id.tag_original_frosted_background, null);
         bg.setTag(R.id.tag_original_frosted_drawable, null);
         bg.setTag(R.id.tag_original_frosted_alpha, null);
         bg.setTag(R.id.tag_original_frosted_foreground, null);
         bg.setTag(R.id.tag_frosted_tint, null);
         sSavedFrostedBackgrounds.remove(bg);
+        sManagedFrostedBackgrounds.remove(bg);
+        sManagedFrostedImages.remove(bg);
+        sManagedFrostedForegrounds.remove(bg);
+        sManagedFrostedScaleTypes.remove(bg);
+    }
+
+    /** 若目标输入法复用了 ImageView 但替换了 Drawable，更新关闭毛玻璃时的恢复基线。 */
+    private static void refreshFrostedOriginalState(ImageView bg) {
+        if (!sSavedFrostedBackgrounds.containsKey(bg)) return;
+
+        Drawable managedBackground = getManagedDrawable(sManagedFrostedBackgrounds, bg);
+        if (sManagedFrostedBackgrounds.containsKey(bg)
+                && bg.getBackground() != managedBackground) {
+            bg.setTag(R.id.tag_original_frosted_background, bg.getBackground());
+        }
+        Drawable managedImage = getManagedDrawable(sManagedFrostedImages, bg);
+        if (sManagedFrostedImages.containsKey(bg)
+                && bg.getDrawable() != managedImage) {
+            bg.setTag(R.id.tag_original_frosted_drawable, bg.getDrawable());
+            bg.setTag(R.id.tag_original_frosted_alpha, bg.getImageAlpha());
+            // 目标已替换图片，旧 tint 不再是当前背景。
+            bg.setTag(R.id.tag_frosted_tint, null);
+        }
+        Drawable managedForeground = getManagedDrawable(sManagedFrostedForegrounds, bg);
+        if (sManagedFrostedForegrounds.containsKey(bg)
+                && bg.getForeground() != managedForeground) {
+            bg.setTag(R.id.tag_original_frosted_foreground, bg.getForeground());
+        }
+        if (sManagedFrostedScaleTypes.containsKey(bg)
+                && bg.getScaleType() != sManagedFrostedScaleTypes.get(bg)) {
+            sOriginalFrostedScaleTypes.put(bg, bg.getScaleType());
+        }
+    }
+
+    private static Drawable getManagedDrawable(
+            java.util.WeakHashMap<ImageView, java.lang.ref.WeakReference<Drawable>> map,
+            ImageView bg) {
+        java.lang.ref.WeakReference<Drawable> ref = map.get(bg);
+        return ref != null ? ref.get() : null;
+    }
+
+    private static void rememberManagedFrostedState(ImageView bg, Drawable background) {
+        sManagedFrostedBackgrounds.put(bg, new java.lang.ref.WeakReference<>(background));
+        sManagedFrostedImages.put(bg,
+                new java.lang.ref.WeakReference<>(bg.getDrawable()));
+        sManagedFrostedForegrounds.put(bg,
+                new java.lang.ref.WeakReference<>(bg.getForeground()));
+        sManagedFrostedScaleTypes.put(bg, bg.getScaleType());
     }
 
     private static void clearFrostedEffect(ImageView bg) {
         restoreFrostedBackground(bg);
     }
 
-    private static void fallback(ImageView bg, View inputView, boolean isDark, MainHook.Config c, int keyBgColor) {
+    private static boolean fallback(ImageView bg, View inputView, boolean isDark, MainHook.Config c, int keyBgColor) {
         try {
             // 所有 fallback 分支都会改 ImageView 的至少一个属性，必须先保存。
             rememberFrostedBackground(bg);
@@ -299,39 +367,41 @@ public class FrostedGlassHelper {
                 base.draw(cnv);
             }
 
-            // 回收旧 Bitmap（仅在无自定义背景图时回收）
-            Drawable oldBg = bg.getDrawable();
+            Drawable oldImage = bg.getDrawable();
             boolean isOurTint = Boolean.TRUE.equals(bg.getTag(R.id.tag_frosted_tint));
             boolean hasCustomImage = !isOurTint
-                    && (oldBg instanceof android.graphics.drawable.BitmapDrawable)
-                    && ((android.graphics.drawable.BitmapDrawable) oldBg).getBitmap() != null;
+                    && (oldImage instanceof android.graphics.drawable.BitmapDrawable)
+                    && ((android.graphics.drawable.BitmapDrawable) oldImage).getBitmap() != null;
 
             if (hasCustomImage) {
-                // 用户有自定义背景图：保留原图，叠加半透明遮罩
                 bg.setImageAlpha(Math.max(10, 255 - alpha));
                 bg.setForeground(new android.graphics.drawable.ColorDrawable(
                         Color.argb(Math.min(255, alpha / 2), 0, 0, 0)));
                 bg.setTag(R.id.tag_frosted_tint, null);
             } else {
-                // 不 recycle 旧 bitmap：可能被其他 view 共享，交给 GC
                 bg.setImageBitmap(out);
                 bg.setImageAlpha(255);
                 bg.setBackground(null);
                 bg.setForeground(null);
                 bg.setTag(R.id.tag_frosted_tint, Boolean.TRUE);
             }
-        } catch (Exception ignored) {}
+            rememberManagedFrostedState(bg, bg.getBackground());
+            return true;
+        } catch (Exception e) {
+            Log.w(TAG, "frosted fallback failed: " + e.getMessage());
+        }
+        return false;
     }
 
     // ══════════════════════════════════════════
     //  键盘圆角 — tint 位图填角 + keyboardView 裁剪
     // ══════════════════════════════════════════
 
-    private static void applyRoundedCorners(View inputView, MainHook.Config c, MainHook.ThemeInfo ti) {
+    private static boolean applyRoundedCorners(View inputView, MainHook.Config c, MainHook.ThemeInfo ti) {
         try {
             if (c.corner <= 0) {
                 clearRoundedCorners(inputView);
-                return;
+                return true;
             }
 
             float r = TypedValue.applyDimension(
@@ -344,7 +414,7 @@ public class FrostedGlassHelper {
             if (kv == null || bgV == null) {
                 Log.w(TAG, "corners skipped: keyboard/background view not found");
                 clearRoundedCorners(inputView);
-                return;
+                return false;
             }
 
             View decorView = inputView.getRootView();
@@ -367,9 +437,11 @@ public class FrostedGlassHelper {
             applyOutline(bgV, r);
 
             Log.i(TAG, "corners: r=" + c.corner + "dp (tint-fill + kv clip)");
+            return true;
         } catch (Throwable t) {
             Log.w(TAG, "corners failed: " + t);
         }
+        return false;
     }
 
     private static void rememberBackground(View view, int tagId) {
@@ -440,19 +512,31 @@ public class FrostedGlassHelper {
             return;
         }
 
-        // 没有可访问 Window 时，最后才退化为根视图透明。
+        // 没有可访问 Window 时，最后才退化为根视图透明；保存 root/parent 以便恢复。
         View root = anyView.getRootView();
+        rememberBackground(root, R.id.tag_original_window_background);
         root.setBackgroundColor(Color.TRANSPARENT);
         if (root.getParent() instanceof View) {
-            ((View) root.getParent()).setBackgroundColor(Color.TRANSPARENT);
+            View parent = (View) root.getParent();
+            rememberBackground(parent, R.id.tag_original_window_background);
+            parent.setBackgroundColor(Color.TRANSPARENT);
         }
         Log.i(TAG, "root transparent fallback");
     }
 
     private static void restoreWindowBackground(View anyView) {
         Window window = findWindow(anyView);
-        if (window == null) return;
+        if (window == null) {
+            // 反射找不到 Window 时，makeWindowTransparent() 会改 root/parent；两者也必须恢复。
+            View root = anyView.getRootView();
+            restoreBackground(root, R.id.tag_original_window_background);
+            if (root.getParent() instanceof View) {
+                restoreBackground((View) root.getParent(), R.id.tag_original_window_background);
+            }
+            return;
+        }
         View decor = window.getDecorView();
+        if (!Boolean.TRUE.equals(decor.getTag(R.id.tag_window_background_saved))) return;
         Object original = decor.getTag(R.id.tag_original_window_background);
         // 原背景允许为 null；必须显式恢复，否则透明 WindowDrawable 会永久保留。
         window.setBackgroundDrawable(original instanceof Drawable ? (Drawable) original : null);
@@ -682,9 +766,17 @@ public class FrostedGlassHelper {
         return null;
     }
 
-    /** customBackground 必须是铺满键盘的 CENTER_CROP ImageView，不能是功能图标。 */
+    /** customBackground 必须是铺满键盘的 ImageView，不能是功能图标。 */
     private static boolean isValidCustomBackground(ImageView image, View keyboardView) {
-        if (image.getScaleType() != ImageView.ScaleType.CENTER_CROP || keyboardView == null) return false;
+        // 应用过毛玻璃后会主动切换为 FIT_XY；通过模块 tag/保存表识别自己的背景，
+        // 不能再强制要求 CENTER_CROP，否则后续配置更新会找不到同一个 ImageView。
+        boolean managedByHelper = Boolean.TRUE.equals(
+                image.getTag(R.id.tag_frosted_tint))
+                || sSavedFrostedBackgrounds.containsKey(image);
+        if (managedByHelper) return true;
+        if (image.getScaleType() != ImageView.ScaleType.CENTER_CROP || keyboardView == null) {
+            return false;
+        }
         int keyboardWidth = keyboardView.getWidth();
         int keyboardHeight = keyboardView.getHeight();
         int imageWidth = image.getWidth();

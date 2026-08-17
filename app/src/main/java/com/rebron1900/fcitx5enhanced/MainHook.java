@@ -1,6 +1,10 @@
 package com.rebron1900.fcitx5enhanced;
 
+import android.content.ContentResolver;
 import android.content.SharedPreferences;
+import android.database.ContentObserver;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.View;
@@ -37,6 +41,8 @@ public class MainHook extends XposedModule {
         public boolean leftBtn = true;
         public boolean rightBtn = true;
         public boolean keyBorder = true;
+        /** Provider revision；旧版 Provider 缺少该列时保持默认 0。 */
+        public long revision = ConfigContract.DEFAULT_REVISION;
 
         /** 快速比较配置是否相等（避免不必要的全量重绘） */
         public boolean equals(Config o) {
@@ -59,13 +65,45 @@ public class MainHook extends XposedModule {
     private Config cfg = new Config();
     private java.lang.ref.WeakReference<View> mCurrentInputViewRef;
     private android.content.SharedPreferences.OnSharedPreferenceChangeListener mThemePrefListener;
+    private SharedPreferences mThemePreferences;
     private boolean mConfigObserved;
+    private ContentResolver mConfigResolver;
+    private boolean mLastConfigReadFromProvider;
+    private Runnable mConfigReadRetry;
+    private int mConfigReadRetryAttempt;
+
+    private static final long CONFIG_APPLY_COALESCE_MS = 50L;
+    private static final long CONFIG_RETRY_INITIAL_MS = 250L;
+    private static final long CONFIG_RETRY_MAX_MS = 5000L;
+    private static final long EFFECTS_RETRY_DELAY_MS = 250L;
+    private static final int EFFECTS_RETRY_MAX_ATTEMPTS = 5;
+    private final Handler mMainHandler = new Handler(Looper.getMainLooper());
+    private ContentObserver mConfigObserver;
+    private Runnable mConfigObserverRetry;
+    private Runnable mPendingConfigApply;
+    private Runnable mEffectsRetry;
+    private boolean mConfigObserverRetryScheduled;
+    private int mConfigObserverRetryAttempt;
+    private int mEffectsRetryAttempt;
+    private int mLifecycleGeneration;
+    private boolean mDestroyed;
+    private long mLastAppliedRevision = Long.MIN_VALUE;
+
+    private enum ApplyReason {
+        INPUT_VIEW,
+        WINDOW_SHOWN,
+        CONFIG_CHANGED,
+        THEME_CHANGED
+    }
 
     /** 上次全量应用过的 InputView（WeakReference 防泄漏；view 重建时必须重新应用） */
     private static java.lang.ref.WeakReference<View> sLastAppliedViewRef = null;
 
     /** 上次全量应用时的配置快照（用于跳过配置未变时的重复调用） */
     private static final Config sLastAppliedCfg = new Config();
+    /** Provider 短暂不可用时保留最后一个可信快照，避免回退到目标进程旧 SP。 */
+    private static volatile Config sLastProviderConfig;
+    private static volatile boolean sLastConfigReadFromProvider;
 
     private static final java.util.WeakHashMap<View,
             java.lang.ref.WeakReference<android.graphics.drawable.Drawable>>
@@ -92,6 +130,8 @@ public class MainHook extends XposedModule {
             hook(setIv).intercept(chain -> {
                 View v = (View) chain.getArgs().get(0);
                 chain.proceed();
+                mDestroyed = false;
+                final int generation = ++mLifecycleGeneration;
 
                 String viewName = v != null ? v.getClass().getName() : "null";
                 Log.i(TAG, "setInputView view=" + viewName);
@@ -103,7 +143,10 @@ public class MainHook extends XposedModule {
                     View fv = v;
                     if (fv.getWidth() > 0 && fv.getHeight() > 0) {
                         // 即使复用同一个 InputView，也强制重建内部效果，覆盖语言/主题切换。
-                        fv.post(() -> applyAllEffects(fv, true));
+                        fv.post(() -> {
+                            if (!isCurrentGeneration(fv, generation)) return;
+                            applyAllEffects(fv, ApplyReason.INPUT_VIEW);
+                        });
                     } else {
                         // post() 可能早于首次 layout，等 layout 完成后再应用。
                         fv.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
@@ -111,7 +154,11 @@ public class MainHook extends XposedModule {
                             public void onLayoutChange(View v, int l, int t, int r, int b,
                                                        int ol, int ot, int or, int ob) {
                                 v.removeOnLayoutChangeListener(this);
-                                v.post(() -> applyAllEffects(fv, true));
+                                if (!isCurrentGeneration(fv, generation)) return;
+                                v.post(() -> {
+                                    if (!isCurrentGeneration(fv, generation)) return;
+                                    applyAllEffects(fv, ApplyReason.INPUT_VIEW);
+                                });
                             }
                         });
                     }
@@ -125,11 +172,34 @@ public class MainHook extends XposedModule {
                 chain.proceed();
                 View cv = getCurrentInputView();
                 if (cv != null) {
-                    // 已在 setInputView 强制应用；窗口重复显示时允许快照跳过。
-                    cv.post(() -> applyAllEffects(cv));
+                    // 窗口显示时主动拉取一次，补偿 Provider/Observer 暂时不可用的情况。
+                    registerConfigObserver(cv);
+                    final int generation = mLifecycleGeneration;
+                    cv.post(() -> {
+                        if (!isCurrentGeneration(cv, generation)) return;
+                        applyAllEffects(cv, ApplyReason.WINDOW_SHOWN);
+                    });
                 }
                 return null;
             });
+
+            try {
+                Method onDestroy = svc.getMethod("onDestroy");
+                hook(onDestroy).intercept(chain -> {
+                    try {
+                        return chain.proceed();
+                    } finally {
+                        mDestroyed = true;
+                        ++mLifecycleGeneration;
+                        unregisterConfigObserver();
+                        cancelEffectsRetry();
+                        KeyEffectsHelper.clear();
+                        mCurrentInputViewRef = null;
+                    }
+                });
+            } catch (Throwable t) {
+                Log.w(TAG, "onDestroy hook unavailable: " + t.getMessage());
+            }
 
             Log.i(TAG, "hook installed");
         } catch (Throwable t) {
@@ -144,19 +214,33 @@ public class MainHook extends XposedModule {
     /** 从模块 SharedPreferences Provider 读取配置，失败时兼容旧版目标进程 SP。 */
     private void readConfig(View anyView) {
         cfg = readConfigSync(anyView);
+        mLastConfigReadFromProvider = sLastConfigReadFromProvider;
+        if (mLastConfigReadFromProvider) cancelConfigReadRetry();
     }
 
     /** 同步读取配置（static，供外部调用）。 */
     public static Config readConfigSync(View anyView) {
+        sLastConfigReadFromProvider = false;
         try (android.database.Cursor cursor = anyView.getContext().getContentResolver().query(
                 ConfigContract.CONTENT_URI, null, null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) {
                 Config config = ConfigContract.fromCursor(cursor);
-                Log.i(TAG, "readConfig from provider: L=" + config.leftBtn + " R=" + config.rightBtn);
+                Log.i(TAG, "readConfig from provider: rev=" + config.revision
+                        + " blur=" + config.blur + " alpha=" + config.alpha
+                        + " L=" + config.leftBtn + " R=" + config.rightBtn);
+                sLastProviderConfig = copyConfig(config);
+                sLastConfigReadFromProvider = true;
                 return config;
             }
         } catch (Throwable t) {
             Log.w(TAG, "readConfig provider failed, using legacy SP: " + t.getMessage());
+        }
+
+        // Provider 已成功读取过后，目标进程 SP 可能只是旧版残留，不能覆盖可信快照。
+        Config lastProviderConfig = sLastProviderConfig;
+        if (lastProviderConfig != null) {
+            Log.w(TAG, "provider unavailable, using last provider snapshot");
+            return copyConfig(lastProviderConfig);
         }
 
         // 仅作为旧版本升级兜底；新版本不再写入目标进程 SP。
@@ -180,37 +264,49 @@ public class MainHook extends XposedModule {
         return config;
     }
 
+    private static Config copyConfig(Config source) {
+        Config copy = new Config();
+        copy.blur = source.blur;
+        copy.alpha = source.alpha;
+        copy.keyAlpha = source.keyAlpha;
+        copy.corner = source.corner;
+        copy.toolbar = source.toolbar;
+        copy.voice = source.voice;
+        copy.leftBtn = source.leftBtn;
+        copy.rightBtn = source.rightBtn;
+        copy.keyBorder = source.keyBorder;
+        copy.revision = source.revision;
+        return copy;
+    }
+
     // ══════════════════════════════════════════
     //  Apply all visual effects
     // ══════════════════════════════════════════
 
-    private void applyAllEffects(View inputView) {
-        applyAllEffects(inputView, false);
-    }
+    private void applyAllEffects(View inputView, ApplyReason reason) {
+        // 主题自身变化不影响模块配置，避免每次主题回调都同步跨进程 query。
+        if (reason != ApplyReason.THEME_CHANGED) {
+            readConfig(inputView);
+            if (!mLastConfigReadFromProvider && mConfigObserved) {
+                scheduleConfigReadRetry();
+            }
+        }
 
-    private void applyAllEffects(View inputView, boolean force) {
-        readConfig(inputView);
-
-        // setInputView、主题变化和 Provider 通知使用 force；窗口重复显示可用快照跳过。
-        // 同一个 InputView 也可能已经替换了内部键盘树或主题对象。
+        // 窗口显示和配置通知都按 revision/内容去重；输入法 View/主题变化仍强制重应用。
+        // 这样既能补偿 Observer 丢失，也不会因重复 notify 反复重建视觉对象。
         View lastView = sLastAppliedViewRef != null ? sLastAppliedViewRef.get() : null;
-        if (!force && sLastAppliedCfg.equals(cfg) && lastView == inputView) {
-            Log.d(TAG, "applyAllEffects: config unchanged, skip");
+        if (lastView != inputView && mEffectsRetry != null) cancelEffectsRetry();
+        boolean sameView = lastView == inputView;
+        boolean sameConfig = sLastAppliedCfg.equals(cfg);
+        boolean sameRevision = mLastAppliedRevision == cfg.revision;
+        boolean configReadIsFresh = reason == ApplyReason.THEME_CHANGED
+                || mLastConfigReadFromProvider;
+        if ((reason == ApplyReason.WINDOW_SHOWN || reason == ApplyReason.CONFIG_CHANGED)
+                && configReadIsFresh && sameView && sameConfig && sameRevision) {
+            Log.d(TAG, "applyAllEffects: config revision unchanged, skip");
             return;
         }
-        sLastAppliedViewRef = new java.lang.ref.WeakReference<>(inputView);
-        // 更新快照
-        sLastAppliedCfg.blur = cfg.blur;
-        sLastAppliedCfg.alpha = cfg.alpha;
-        sLastAppliedCfg.keyAlpha = cfg.keyAlpha;
-        sLastAppliedCfg.corner = cfg.corner;
-        sLastAppliedCfg.toolbar = cfg.toolbar;
-        sLastAppliedCfg.voice = cfg.voice;
-        sLastAppliedCfg.leftBtn = cfg.leftBtn;
-        sLastAppliedCfg.rightBtn = cfg.rightBtn;
-        sLastAppliedCfg.keyBorder = cfg.keyBorder;
-
-        Log.i(TAG, "applyAllEffects start");
+        Log.i(TAG, "applyAllEffects start rev=" + cfg.revision + " reason=" + reason);
 
         // 一次性提取主题信息，避免各 Helper 重复反射
         ThemeInfo themeInfo = new ThemeInfo();
@@ -230,12 +326,32 @@ public class MainHook extends XposedModule {
         final MainHook.Config c = cfg;
         final MainHook.ThemeInfo ti = themeInfo;
 
-        FrostedGlassHelper.apply(inputView, c, ti);
+        boolean frostedApplied = FrostedGlassHelper.apply(inputView, c, ti);
         roundToolbarTop(inputView);
         PreeditHelper.apply(inputView, c, ti);
         ExtraButtonsHelper.add(inputView, c, ti);
-        KeyEffectsHelper.apply(inputView, c, ti.isDark);
+        boolean keyEffectsApplied = KeyEffectsHelper.apply(inputView, c, ti.isDark);
 
+        if (!frostedApplied || !keyEffectsApplied) {
+            Log.w(TAG, "applyAllEffects incomplete: frosted=" + frostedApplied
+                    + " keyEffects=" + keyEffectsApplied);
+            scheduleEffectsRetry(inputView);
+            return;
+        }
+
+        // 只有主要 Helper 完整应用后才记录快照；初始化时 View 尚未就绪时会继续重试。
+        sLastAppliedViewRef = new java.lang.ref.WeakReference<>(inputView);
+        sLastAppliedCfg.blur = cfg.blur;
+        sLastAppliedCfg.alpha = cfg.alpha;
+        sLastAppliedCfg.keyAlpha = cfg.keyAlpha;
+        sLastAppliedCfg.corner = cfg.corner;
+        sLastAppliedCfg.toolbar = cfg.toolbar;
+        sLastAppliedCfg.voice = cfg.voice;
+        sLastAppliedCfg.leftBtn = cfg.leftBtn;
+        sLastAppliedCfg.rightBtn = cfg.rightBtn;
+        sLastAppliedCfg.keyBorder = cfg.keyBorder;
+        mLastAppliedRevision = cfg.revision;
+        cancelEffectsRetry();
         Log.i(TAG, "applyAllEffects done");
     }
 
@@ -316,6 +432,7 @@ public class MainHook extends XposedModule {
 
     private void roundToolbarTopWithRetry(View inputView, View toolbar, int attempt) {
         try {
+            if (mDestroyed || inputView != getCurrentInputView()) return;
             if (cfg.toolbar <= 0) {
                 clearToolbarRounding(toolbar);
                 return;
@@ -383,11 +500,18 @@ public class MainHook extends XposedModule {
             android.content.SharedPreferences sp =
                 android.preference.PreferenceManager.getDefaultSharedPreferences(
                     anyView.getContext());
+            mThemePreferences = sp;
             mThemePrefListener = (sp_, key) -> {
                 try {
                     Log.i(TAG, key + " changed, re-applying effects");
                     View cv = getCurrentInputView();
-                    if (cv != null) cv.post(() -> applyAllEffects(cv, true));
+                    if (cv != null) {
+                        final int generation = mLifecycleGeneration;
+                        cv.post(() -> {
+                            if (!isCurrentGeneration(cv, generation)) return;
+                            applyAllEffects(cv, ApplyReason.THEME_CHANGED);
+                        });
+                    }
                 } catch (Throwable t) {
                     Log.w(TAG, "theme pref listener: " + t.getMessage());
                 }
@@ -407,21 +531,142 @@ public class MainHook extends XposedModule {
     private void registerConfigObserver(View anyView) {
         if (mConfigObserved) return;
         try {
-            anyView.getContext().getContentResolver().registerContentObserver(
-                    ConfigContract.CONTENT_URI, false,
-                    new android.database.ContentObserver(
-                            new android.os.Handler(android.os.Looper.getMainLooper())) {
-                        @Override
-                        public void onChange(boolean selfChange) {
-                            View cv = getCurrentInputView();
-                            if (cv != null) cv.post(() -> applyAllEffects(cv, true));
-                        }
-                    });
+            if (mConfigObserver == null) {
+                mConfigObserver = new ContentObserver(mMainHandler) {
+                    @Override
+                    public void onChange(boolean selfChange) {
+                        // 一次拖动/连续设置可能产生多次通知，只合并成一次最新配置应用。
+                        scheduleConfigApply(CONFIG_APPLY_COALESCE_MS);
+                    }
+                };
+            }
+            ContentResolver resolver = anyView.getContext().getContentResolver();
+            resolver.registerContentObserver(
+                    ConfigContract.CONTENT_URI, false, mConfigObserver);
+            mConfigResolver = resolver;
             mConfigObserved = true;
+            cancelConfigReadRetry();
+            mConfigObserverRetryAttempt = 0;
+            cancelConfigObserverRetry();
             Log.i(TAG, "config observer registered");
         } catch (Throwable t) {
             Log.w(TAG, "config observer failed: " + t);
+            scheduleConfigObserverRetry();
         }
+    }
+
+    /** Provider 可能因模块进程尚未启动而暂不可用，使用退避重试而不是永久失去监听。 */
+    private void scheduleConfigObserverRetry() {
+        if (mConfigObserved || mConfigObserverRetryScheduled) return;
+        int shift = Math.min(mConfigObserverRetryAttempt, 5);
+        long delay = Math.min(CONFIG_RETRY_MAX_MS,
+                CONFIG_RETRY_INITIAL_MS << shift);
+        mConfigObserverRetryAttempt++;
+        mConfigObserverRetryScheduled = true;
+        mConfigObserverRetry = () -> {
+            mConfigObserverRetryScheduled = false;
+            View cv = getCurrentInputView();
+            if (cv != null) {
+                boolean wasObserved = mConfigObserved;
+                registerConfigObserver(cv);
+                if (!wasObserved && mConfigObserved) scheduleConfigApply(0L);
+            }
+        };
+        mMainHandler.postDelayed(mConfigObserverRetry, delay);
+        Log.d(TAG, "config observer retry in " + delay + "ms");
+    }
+
+    private void scheduleConfigReadRetry() {
+        if (!mConfigObserved || mConfigReadRetry != null || mConfigReadRetryAttempt >= 5) return;
+        long delay = Math.min(CONFIG_RETRY_MAX_MS,
+                CONFIG_RETRY_INITIAL_MS << Math.min(mConfigReadRetryAttempt, 4));
+        mConfigReadRetryAttempt++;
+        mConfigReadRetry = () -> {
+            mConfigReadRetry = null;
+            View cv = getCurrentInputView();
+            if (cv != null) applyAllEffects(cv, ApplyReason.CONFIG_CHANGED);
+        };
+        mMainHandler.postDelayed(mConfigReadRetry, delay);
+        Log.d(TAG, "config read retry in " + delay + "ms");
+    }
+
+    private void cancelConfigReadRetry() {
+        if (mConfigReadRetry != null) mMainHandler.removeCallbacks(mConfigReadRetry);
+        mConfigReadRetry = null;
+        mConfigReadRetryAttempt = 0;
+    }
+
+    private void cancelConfigObserverRetry() {
+        if (mConfigObserverRetry != null) {
+            mMainHandler.removeCallbacks(mConfigObserverRetry);
+        }
+        mConfigObserverRetry = null;
+        mConfigObserverRetryScheduled = false;
+    }
+
+    private void unregisterConfigObserver() {
+        cancelConfigObserverRetry();
+        cancelConfigReadRetry();
+        if (mPendingConfigApply != null) {
+            mMainHandler.removeCallbacks(mPendingConfigApply);
+            mPendingConfigApply = null;
+        }
+        if (mConfigObserved && mConfigResolver != null && mConfigObserver != null) {
+            try {
+                mConfigResolver.unregisterContentObserver(mConfigObserver);
+            } catch (Throwable t) {
+                Log.w(TAG, "config observer unregister failed: " + t.getMessage());
+            }
+        }
+        mConfigResolver = null;
+        mConfigObserved = false;
+        if (mThemePreferences != null && mThemePrefListener != null) {
+            try {
+                mThemePreferences.unregisterOnSharedPreferenceChangeListener(mThemePrefListener);
+            } catch (Throwable t) {
+                Log.w(TAG, "theme listener unregister failed: " + t.getMessage());
+            }
+        }
+        mThemePreferences = null;
+        mThemePrefListener = null;
+    }
+
+    /** 合并 Provider 通知，读取时始终以最新 revision 为准。 */
+    private void scheduleConfigApply(long delayMs) {
+        if (mPendingConfigApply != null) return;
+        mPendingConfigApply = () -> {
+            mPendingConfigApply = null;
+            View cv = getCurrentInputView();
+            if (cv != null) applyAllEffects(cv, ApplyReason.CONFIG_CHANGED);
+        };
+        mMainHandler.postDelayed(mPendingConfigApply, delayMs);
+    }
+
+    private void scheduleEffectsRetry(View inputView) {
+        if (mEffectsRetry != null || mEffectsRetryAttempt >= EFFECTS_RETRY_MAX_ATTEMPTS) return;
+        java.lang.ref.WeakReference<View> viewRef = new java.lang.ref.WeakReference<>(inputView);
+        mEffectsRetryAttempt++;
+        mEffectsRetry = () -> {
+            mEffectsRetry = null;
+            View current = getCurrentInputView();
+            View expected = viewRef.get();
+            if (current != null && current == expected) {
+                applyAllEffects(current, ApplyReason.INPUT_VIEW);
+            }
+        };
+        mMainHandler.postDelayed(mEffectsRetry, EFFECTS_RETRY_DELAY_MS);
+        Log.d(TAG, "effects retry in " + EFFECTS_RETRY_DELAY_MS
+                + "ms (" + mEffectsRetryAttempt + "/" + EFFECTS_RETRY_MAX_ATTEMPTS + ")");
+    }
+
+    private void cancelEffectsRetry() {
+        if (mEffectsRetry != null) mMainHandler.removeCallbacks(mEffectsRetry);
+        mEffectsRetry = null;
+        mEffectsRetryAttempt = 0;
+    }
+
+    private boolean isCurrentGeneration(View view, int generation) {
+        return !mDestroyed && generation == mLifecycleGeneration && view == getCurrentInputView();
     }
 
     private View getCurrentInputView() {

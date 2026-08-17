@@ -46,17 +46,36 @@ public class KeyEffectsHelper {
     /** 标记 listener 中是否正在执行，防止重入 */
     private static boolean sApplying = false;
 
+    /** 布局稳定后再检查一次，避免动画/输入法布局抖动触发全树遍历。 */
+    private static final long LAYOUT_SETTLE_DELAY_MS = 250L;
+    private static Runnable mPendingLayoutCheck;
+
     /** 记录上次的 wmView（弱引用），检测 InputView 是否变化 */
     private static java.lang.ref.WeakReference<ViewGroup> sLastWmViewRef = null;
 
-    /** 键盘 View 树哈希（快速检测结构变化，避免每次 layout 全量遍历） */
+    /** 键盘 View 树哈希（布局稳定后检测结构变化）。 */
     private static int sLastViewHash = 0;
+
+    /** 描边所依赖的主题/输入法参数指纹，变化时允许重建已有描边。 */
+    private static int sLastStyleFingerprint = Integer.MIN_VALUE;
 
     /** 每次 apply 时从 SP 读取的主题参数（不缓存，保证实时性） */
     private static int sKeyRadius = 4;
     private static boolean sSpecialKeyOval = false;
 
-    public static void apply(View inputView, MainHook.Config c, boolean isDark) {
+    /** 输入法服务销毁时移除全局布局监听和延迟检查，避免旧 View 继续回调。 */
+    public static void clear() {
+        removeOldListener();
+        sOriginalForegrounds.clear();
+        sOriginalAlphas.clear();
+        sBorderedViews.clear();
+        sAppearanceCache.clear();
+        sLastWmViewRef = null;
+        sLastViewHash = 0;
+        sLastStyleFingerprint = Integer.MIN_VALUE;
+    }
+
+    public static boolean apply(View inputView, MainHook.Config c, boolean isDark) {
         try {
             Field wf = findField(inputView.getClass(), "windowManager");
             if (wf == null) throw new NoSuchFieldException("windowManager");
@@ -64,7 +83,7 @@ public class KeyEffectsHelper {
             Object wm = wf.get(inputView);
             Method gv = wm.getClass().getMethod("getView");
             final ViewGroup wmView = (ViewGroup) gv.invoke(wm);
-            if (wmView == null) return;
+            if (wmView == null) return false;
 
             int keyAlpha = c.keyAlpha;
 
@@ -75,50 +94,65 @@ public class KeyEffectsHelper {
             // 移除旧 listener
             removeOldListener();
 
-            // 只在 InputView 变化时清除缓存（新 view 树，旧缓存无效）
+            // 只在 InputView 变化时清除缓存（新 view 树，旧缓存无效）。
+            // 主题/描边参数变化时也清除描边缓存，确保配置能实时生效。
             ViewGroup lastWm = sLastWmViewRef != null ? sLastWmViewRef.get() : null;
-            if (wmView != lastWm) {
+            int styleFingerprint = computeStyleFingerprint(c, isDark);
+            if (wmView != lastWm || styleFingerprint != sLastStyleFingerprint) {
                 sBorderedViews.clear();
                 sOriginalForegrounds.clear();
                 sAppearanceCache.clear();
+                sLastStyleFingerprint = styleFingerprint;
                 sLastWmViewRef = new java.lang.ref.WeakReference<>(wmView);
             }
 
             // 单次遍历完成透明度+描边，避免两次全树遍历
             applyKeyEffects(wmView, keyAlpha, c, isDark);
 
-            // listener 处理新增按键和中英文切换
-            // 使用 View 树哈希快速检测结构变化，命中跳过遍历以提升打字帧率
+            // listener 处理新增按键和中英文切换。
+            // 输入法动画期间可能每帧触发布局；只在布局稳定后合并检查，
+            // 避免每次回调都计算哈希、递归遍历并重建按键描边。
             final java.lang.ref.WeakReference<ViewGroup> wmViewRef =
                     new java.lang.ref.WeakReference<>(wmView);
             mKeyLayoutListener = () -> {
                 if (sApplying) return;  // 防重入
                 ViewGroup current = wmViewRef.get();
                 if (current == null) return;
-                sApplying = true;
-                try {
-                    int newHash = computeViewHash(current);
-                    if (newHash == sLastViewHash) {
-                        Log.d(TAG, "layout: view tree unchanged, skip traversal");
-                        return;
+
+                Runnable previous = mPendingLayoutCheck;
+                if (previous != null) current.removeCallbacks(previous);
+
+                Runnable check = () -> {
+                    ViewGroup settled = wmViewRef.get();
+                    if (settled == null || sApplying) return;
+                    sApplying = true;
+                    try {
+                        int newHash = computeViewHash(settled);
+                        if (newHash == sLastViewHash) return;
+                        sLastViewHash = newHash;
+                        // 树节点可能复用但替换 appearanceView；旧缓存不能跨结构变化继续使用。
+                        sAppearanceCache.clear();
+                        Log.d(TAG, "layout settled: view tree changed, applying key effects");
+                        applyKeyEffects(settled, c.keyAlpha, c, isDark);
+                    } finally {
+                        sApplying = false;
                     }
-                    sLastViewHash = newHash;
-                    Log.i(TAG, "layout: view tree changed, applying key effects");
-                    applyKeyEffects(current, c.keyAlpha, c, isDark);
-                } finally {
-                    sApplying = false;
-                }
+                };
+                mPendingLayoutCheck = check;
+                current.postDelayed(check, LAYOUT_SETTLE_DELAY_MS);
             };
             mAttachedViewRef = new java.lang.ref.WeakReference<>(wmView);
             wmView.getViewTreeObserver().addOnGlobalLayoutListener(mKeyLayoutListener);
 
-            // 初始遍历后记录哈希值（下次 layout 变化时才重新遍历）
+            // 初始遍历后记录哈希值（下次布局稳定且结构变化时才重新遍历）
             sLastViewHash = computeViewHash(wmView);
 
             Log.i(TAG, "key effects: alpha=" + keyAlpha);
+            return true;
         } catch (Throwable t) {
             Log.w(TAG, "applyKeyEffects: " + t.getMessage());
         }
+        return false;
     }
 
     private static Field findField(Class<?> start, String name) {
@@ -132,16 +166,30 @@ public class KeyEffectsHelper {
 
     private static void removeOldListener() {
         ViewGroup attached = mAttachedViewRef != null ? mAttachedViewRef.get() : null;
-        if (mKeyLayoutListener != null && attached != null) {
+        if (attached != null) {
+            if (mPendingLayoutCheck != null) {
+                attached.removeCallbacks(mPendingLayoutCheck);
+            }
             try {
                 ViewTreeObserver vto = attached.getViewTreeObserver();
-                if (vto.isAlive()) {
+                if (vto.isAlive() && mKeyLayoutListener != null) {
                     vto.removeOnGlobalLayoutListener(mKeyLayoutListener);
                 }
             } catch (Exception ignored) {}
         }
+        mPendingLayoutCheck = null;
         mKeyLayoutListener = null;
         mAttachedViewRef = null;
+    }
+
+    /** 计算描边缓存指纹；仅这些参数变化时才需要重建已有 Drawable。 */
+    private static int computeStyleFingerprint(MainHook.Config c, boolean isDark) {
+        int hash = c.keyAlpha;
+        hash = hash * 31 + (c.keyBorder ? 1 : 0);
+        hash = hash * 31 + (isDark ? 1 : 0);
+        hash = hash * 31 + sKeyRadius;
+        hash = hash * 31 + (sSpecialKeyOval ? 1 : 0);
+        return hash;
     }
 
     /** 计算有限深度的 View 树哈希，覆盖语言切换时替换的内部按键。 */
@@ -200,9 +248,11 @@ public class KeyEffectsHelper {
                         }
                     }
 
-                    // 描边配置、主题或圆角变化时都重建 Drawable，避免旧缓存阻止更新。
+                    // 只给新发现的按键创建描边；配置/主题变化时 apply() 会先清空缓存。
                     if (needBorder) {
-                        applyKeyGlassBorder(appView, c, isDark);
+                        if (!sBorderedViews.containsKey(appView)) {
+                            applyKeyGlassBorder(appView, c, isDark);
+                        }
                     } else {
                         removeBorderFromView(appView);
                     }
@@ -273,7 +323,7 @@ public class KeyEffectsHelper {
     private static View findAppearanceView(View v) {
         java.lang.ref.WeakReference<View> cachedRef = sAppearanceCache.get(v);
         View cached = cachedRef != null ? cachedRef.get() : null;
-        if (cached != null) return cached;
+        if (cached != null && (cached == v || isDescendantOf(cached, v))) return cached;
         if (cachedRef != null) sAppearanceCache.remove(v);
 
         Class<?> c = v.getClass();
@@ -304,6 +354,19 @@ public class KeyEffectsHelper {
             c = c.getSuperclass();
         }
         return null;
+    }
+
+    private static boolean isDescendantOf(View child, View ancestor) {
+        View current = child;
+        while (current != null) {
+            if (current == ancestor) return true;
+            if (current.getParent() instanceof View) {
+                current = (View) current.getParent();
+            } else {
+                break;
+            }
+        }
+        return false;
     }
 
     // ══════════════════════════════════════════

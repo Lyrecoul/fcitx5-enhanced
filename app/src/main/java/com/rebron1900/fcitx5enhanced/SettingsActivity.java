@@ -18,12 +18,14 @@ public class SettingsActivity extends Activity {
     private SeekBar sbBlur, sbAlpha, sbKeyAlpha, sbCorner;
     private TextView tvBlur, tvAlpha, tvKeyAlpha, tvCorner;
     private Switch swVoice, swLeft, swRight, swKeyBorder;
+    /** 最近一次已提交的界面快照；只提交实际变化字段，避免旧 Activity 覆盖并发修改。 */
+    private MainHook.Config mSavedConfig;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_settings);
-        setTitle("Fcitx5 增强");
+        setTitle(R.string.settings_title);
 
         sbBlur = findViewById(R.id.sb_blur_radius);
         sbAlpha = findViewById(R.id.sb_bg_alpha);
@@ -41,11 +43,7 @@ public class SettingsActivity extends Activity {
         SeekBar.OnSeekBarChangeListener listener = new SeekBar.OnSeekBarChangeListener() {
             @Override
             public void onProgressChanged(SeekBar sb, int progress, boolean fromUser) {
-                if (!fromUser) return;
-                if (sb == sbBlur) tvBlur.setText(progress == 0 ? "关" : progress + "");
-                else if (sb == sbAlpha) tvAlpha.setText((progress * 100) / 255 + "%");
-                else if (sb == sbKeyAlpha) tvKeyAlpha.setText((progress * 100) / 255 + "%");
-                else if (sb == sbCorner) tvCorner.setText(progress == 0 ? "关" : progress + "");
+                if (fromUser) updateLabels();
             }
             @Override public void onStartTrackingTouch(SeekBar sb) {}
             @Override public void onStopTrackingTouch(SeekBar sb) { saveAndApply(); }
@@ -79,24 +77,33 @@ public class SettingsActivity extends Activity {
         SharedPreferences sp = getConfigPreferences();
         migrateLegacySettings(sp);
 
-        sbBlur.setProgress(sp.getInt(ConfigContract.BLUR_RADIUS, ConfigContract.DEFAULT_BLUR));
-        sbAlpha.setProgress(sp.getInt(ConfigContract.BG_ALPHA, ConfigContract.DEFAULT_ALPHA));
-        sbKeyAlpha.setProgress(sp.getInt(ConfigContract.KEY_ALPHA, ConfigContract.DEFAULT_KEY_ALPHA));
-        sbCorner.setProgress(sp.getInt(ConfigContract.CORNER_RADIUS, ConfigContract.DEFAULT_CORNER));
+        sbBlur.setProgress(clamp(sp.getInt(ConfigContract.BLUR_RADIUS,
+                ConfigContract.DEFAULT_BLUR), 0, 100));
+        sbAlpha.setProgress(clamp(sp.getInt(ConfigContract.BG_ALPHA,
+                ConfigContract.DEFAULT_ALPHA), 0, 255));
+        sbKeyAlpha.setProgress(clamp(sp.getInt(ConfigContract.KEY_ALPHA,
+                ConfigContract.DEFAULT_KEY_ALPHA), 0, 255));
+        sbCorner.setProgress(clamp(sp.getInt(ConfigContract.CORNER_RADIUS,
+                ConfigContract.DEFAULT_CORNER), 0, 48));
         swVoice.setChecked(sp.getBoolean(ConfigContract.VOICE_ENABLED, ConfigContract.DEFAULT_VOICE));
         swLeft.setChecked(sp.getBoolean(ConfigContract.SHOW_LEFT_BUTTON, ConfigContract.DEFAULT_LEFT_BUTTON));
         swRight.setChecked(sp.getBoolean(ConfigContract.SHOW_RIGHT_BUTTON, ConfigContract.DEFAULT_RIGHT_BUTTON));
         swKeyBorder.setChecked(sp.getBoolean(ConfigContract.KEY_BORDER, ConfigContract.DEFAULT_KEY_BORDER));
         updateLabels();
+        mSavedConfig = captureConfig();
     }
 
     /** 将旧版 Activity 私有 SP 迁移到新的统一配置 SP。 */
     private void migrateLegacySettings(SharedPreferences target) {
-        if (target.contains(ConfigContract.BLUR_RADIUS)) return;
+        // revision 也作为统一配置已初始化标记；增量 fallback 可能尚未写入 blur。
+        if (target.contains(ConfigContract.BLUR_RADIUS)
+                || target.contains(ConfigContract.REVISION)) return;
         SharedPreferences legacy = getPreferences(MODE_PRIVATE);
         if (!legacy.contains("blur_radius")) return;
 
         target.edit()
+                .putLong(ConfigContract.REVISION,
+                        ConfigContract.nextRevision(ConfigContract.DEFAULT_REVISION))
                 .putInt(ConfigContract.BLUR_RADIUS, legacy.getInt("blur_radius", ConfigContract.DEFAULT_BLUR))
                 .putInt(ConfigContract.BG_ALPHA, legacy.getInt("bg_alpha", ConfigContract.DEFAULT_ALPHA))
                 .putInt(ConfigContract.KEY_ALPHA, legacy.getInt("key_alpha", ConfigContract.DEFAULT_KEY_ALPHA))
@@ -110,13 +117,44 @@ public class SettingsActivity extends Activity {
     }
 
     private void updateLabels() {
-        tvBlur.setText(sbBlur.getProgress() == 0 ? "关" : String.valueOf(sbBlur.getProgress()));
-        tvAlpha.setText((sbAlpha.getProgress() * 100) / 255 + "%");
-        tvKeyAlpha.setText((sbKeyAlpha.getProgress() * 100) / 255 + "%");
-        tvCorner.setText(sbCorner.getProgress() == 0 ? "关" : String.valueOf(sbCorner.getProgress()));
+        tvBlur.setText(getString(R.string.settings_blur_value_format, sbBlur.getProgress()));
+        tvAlpha.setText(getString(R.string.settings_opacity_value_format,
+                toPercent(sbAlpha.getProgress())));
+        tvKeyAlpha.setText(getString(R.string.settings_opacity_value_format,
+                toPercent(sbKeyAlpha.getProgress())));
+        tvCorner.setText(getString(R.string.settings_corner_value_format, sbCorner.getProgress()));
+    }
+
+    /** 内部透明度使用 0–255；界面统一显示四舍五入后的 0–100%。 */
+    private static int toPercent(int alpha) {
+        return Math.round(alpha * 100f / 255f);
+    }
+
+    private static int clamp(int value, int min, int max) {
+        return Math.max(min, Math.min(max, value));
     }
 
     private void saveAndApply() {
+        MainHook.Config config = captureConfig();
+        ContentValues values = ConfigContract.toChangedValues(config, mSavedConfig);
+        if (values.size() == 0) return;
+
+        Log.i(TAG, "Settings saving: L=" + config.leftBtn
+                + " R=" + config.rightBtn + " V=" + config.voice);
+
+        boolean saved = false;
+        try {
+            int updated = getContentResolver().update(
+                    ConfigContract.CONTENT_URI, values, null, null);
+            saved = updated > 0;
+        } catch (Exception e) {
+            Log.w(TAG, "ConfigProvider update failed, writing local fallback", e);
+        }
+        if (!saved) saved = writeLocalFallback(values);
+        if (saved) mSavedConfig = config;
+    }
+
+    private MainHook.Config captureConfig() {
         MainHook.Config config = new MainHook.Config();
         config.blur = sbBlur.getProgress();
         config.alpha = sbAlpha.getProgress();
@@ -127,23 +165,15 @@ public class SettingsActivity extends Activity {
         config.leftBtn = swLeft.isChecked();
         config.rightBtn = swRight.isChecked();
         config.keyBorder = swKeyBorder.isChecked();
-
-        Log.i(TAG, "Settings saving: L=" + config.leftBtn
-                + " R=" + config.rightBtn + " V=" + config.voice);
-
-        ContentValues values = ConfigContract.toValues(config);
-        try {
-            int updated = getContentResolver().update(
-                    ConfigContract.CONTENT_URI, values, null, null);
-            if (updated <= 0) writeLocalFallback(values);
-        } catch (Exception e) {
-            Log.w(TAG, "ConfigProvider update failed, writing local fallback", e);
-            writeLocalFallback(values);
-        }
+        return config;
     }
 
-    private void writeLocalFallback(ContentValues values) {
-        SharedPreferences.Editor editor = getConfigPreferences().edit();
+    private boolean writeLocalFallback(ContentValues values) {
+        SharedPreferences preferences = getConfigPreferences();
+        SharedPreferences.Editor editor = preferences.edit();
+        editor.putLong(ConfigContract.REVISION,
+                ConfigContract.nextRevision(preferences.getLong(
+                        ConfigContract.REVISION, ConfigContract.DEFAULT_REVISION)));
         Object blur = values.get(ConfigContract.BLUR_RADIUS);
         Object alpha = values.get(ConfigContract.BG_ALPHA);
         Object keyAlpha = values.get(ConfigContract.KEY_ALPHA);
@@ -164,6 +194,16 @@ public class SettingsActivity extends Activity {
         if (values.containsKey(ConfigContract.KEY_BORDER)) {
             editor.putBoolean(ConfigContract.KEY_BORDER, values.getAsBoolean(ConfigContract.KEY_BORDER));
         }
-        editor.commit();
+        boolean committed = editor.commit();
+        if (committed) {
+            // Provider 暂不可用时仍尽量唤醒已注册的目标进程 Observer；
+            // 下一次 onWindowShown 还会通过 revision 主动拉取兜底。
+            try {
+                getContentResolver().notifyChange(ConfigContract.CONTENT_URI, null);
+            } catch (Exception e) {
+                Log.w(TAG, "local config notify failed", e);
+            }
+        }
+        return committed;
     }
 }

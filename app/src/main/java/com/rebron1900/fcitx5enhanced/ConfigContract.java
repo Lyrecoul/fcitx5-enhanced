@@ -14,6 +14,9 @@ public final class ConfigContract {
     public static final String AUTHORITY = "com.rebron1900.fcitx5enhanced.config";
     public static final Uri CONTENT_URI = Uri.parse("content://" + AUTHORITY + "/config");
     public static final String PREFS_NAME = "fcitx5_enhanced_config";
+    /** 每次配置写入递增；用于跨进程通知去重和补偿 Provider 晚启动。 */
+    public static final String REVISION = "config_revision";
+    public static final long DEFAULT_REVISION = 0L;
 
     public static final String SHOW_LEFT_BUTTON = "show_left_button";
     public static final String SHOW_RIGHT_BUTTON = "show_right_button";
@@ -48,8 +51,27 @@ public final class ConfigContract {
         return values;
     }
 
+    /** 只提交本页实际变化的字段，避免旧设置页快照覆盖其他并发修改。 */
+    public static ContentValues toChangedValues(MainHook.Config current, MainHook.Config previous) {
+        if (previous == null) return toValues(current);
+        ContentValues values = new ContentValues();
+        if (current.blur != previous.blur) values.put(BLUR_RADIUS, current.blur);
+        if (current.alpha != previous.alpha) values.put(BG_ALPHA, current.alpha);
+        if (current.keyAlpha != previous.keyAlpha) values.put(KEY_ALPHA, current.keyAlpha);
+        if (current.corner != previous.corner) values.put(CORNER_RADIUS, current.corner);
+        if (current.voice != previous.voice) values.put(VOICE_ENABLED, current.voice);
+        if (current.leftBtn != previous.leftBtn) values.put(SHOW_LEFT_BUTTON, current.leftBtn);
+        if (current.rightBtn != previous.rightBtn) values.put(SHOW_RIGHT_BUTTON, current.rightBtn);
+        if (current.keyBorder != previous.keyBorder) values.put(KEY_BORDER, current.keyBorder);
+        return values;
+    }
+
     public static MainHook.Config fromCursor(Cursor cursor) {
         MainHook.Config config = new MainHook.Config();
+        int revisionColumn = cursor.getColumnIndex(REVISION);
+        if (revisionColumn >= 0 && !cursor.isNull(revisionColumn)) {
+            config.revision = cursor.getLong(revisionColumn);
+        }
         config.leftBtn = cursor.getInt(cursor.getColumnIndexOrThrow(SHOW_LEFT_BUTTON)) != 0;
         config.rightBtn = cursor.getInt(cursor.getColumnIndexOrThrow(SHOW_RIGHT_BUTTON)) != 0;
         config.voice = cursor.getInt(cursor.getColumnIndexOrThrow(VOICE_ENABLED)) != 0;
@@ -64,11 +86,16 @@ public final class ConfigContract {
 
     /** 防止损坏配置或恶意 Provider 调用传入异常尺寸/透明度。 */
     public static void sanitize(MainHook.Config config) {
-        config.blur = clamp(config.blur, 0, 1000);
+        config.blur = clamp(config.blur, 0, 100);
         config.alpha = clamp(config.alpha, 0, 255);
         config.keyAlpha = clamp(config.keyAlpha, 0, 255);
-        config.corner = clamp(config.corner, 0, 100);
+        config.corner = clamp(config.corner, 0, 48);
         config.toolbar = config.corner;
+    }
+
+    /** 递增 revision，避免 Long.MAX_VALUE 溢出为负数。 */
+    public static long nextRevision(long revision) {
+        return revision == Long.MAX_VALUE ? 1L : revision + 1L;
     }
 
     private static int clamp(int value, int min, int max) {

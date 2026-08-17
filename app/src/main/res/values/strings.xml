@@ -1,4 +1,41 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="module_description">Fcitx5 键盘毛玻璃背景 + 圆角美化</string>
+    <string name="settings_title">Fcitx5 增强</string>
+    <string name="settings_section_appearance">外观</string>
+    <string name="settings_section_toolbar">底部工具栏</string>
+    <string name="settings_section_keys">按键效果</string>
+
+    <string name="settings_blur_label">模糊强度</string>
+    <string name="settings_blur_desc">范围：0–100。数值越大，模糊越强；0 表示关闭。</string>
+    <string name="settings_blur_value_format">%1$d</string>
+    <string name="settings_blur_accessibility">模糊强度，范围 0 到 100</string>
+    <string name="settings_blur_default">100</string>
+
+    <string name="settings_bg_opacity_label">背景叠加层不透明度</string>
+    <string name="settings_bg_opacity_desc">范围：0–100%。只影响背景叠加层，不改变原背景图片和模糊强度。</string>
+    <string name="settings_opacity_value_format">%1$d%%</string>
+    <string name="settings_bg_opacity_accessibility">背景叠加层不透明度，范围 0 到 100%</string>
+    <string name="settings_bg_opacity_default">24%</string>
+
+    <string name="settings_key_opacity_label">按键不透明度</string>
+    <string name="settings_key_opacity_desc">范围：0–100%。仅影响按键背景，不影响键盘背景。</string>
+    <string name="settings_key_opacity_accessibility">按键不透明度，范围 0 到 100%</string>
+    <string name="settings_key_opacity_default">55%</string>
+
+    <string name="settings_corner_label">键盘圆角</string>
+    <string name="settings_corner_desc">范围：0–48dp。0 表示关闭键盘圆角。</string>
+    <string name="settings_corner_value_format">%1$ddp</string>
+    <string name="settings_corner_accessibility">键盘圆角，范围 0 到 48dp</string>
+    <string name="settings_corner_default">20dp</string>
+
+    <string name="settings_voice_label">启用语音输入</string>
+    <string name="settings_voice_desc">启用工具栏中的语音输入按钮。</string>
+    <string name="settings_ime_label">显示输入法切换按钮</string>
+    <string name="settings_ime_desc">在工具栏左侧显示输入法切换按钮。</string>
+    <string name="settings_clipboard_label">显示剪贴板按钮</string>
+    <string name="settings_clipboard_desc">在工具栏右侧显示剪贴板历史按钮。</string>
+    <string name="settings_border_label">启用按键描边</string>
+    <string name="settings_border_desc">为按键添加玻璃渐变描边。</string>
+    <string name="settings_live_note">修改后立即生效，无需保存。</string>
 </resources>

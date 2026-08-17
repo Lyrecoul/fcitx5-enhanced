@@ -17,6 +17,7 @@ import android.util.Log;
 public class ConfigProvider extends ContentProvider {
     private static final String TAG = "Fcitx5Enh";
     private static final String[] COLUMNS = {
+            ConfigContract.REVISION,
             ConfigContract.SHOW_LEFT_BUTTON,
             ConfigContract.SHOW_RIGHT_BUTTON,
             ConfigContract.VOICE_ENABLED,
@@ -47,23 +48,30 @@ public class ConfigProvider extends ContentProvider {
         if (values == null || values.size() == 0) return 0;
 
         try {
-            SharedPreferences.Editor editor = preferences().edit();
-            putBoolean(editor, values, ConfigContract.SHOW_LEFT_BUTTON);
-            putBoolean(editor, values, ConfigContract.SHOW_RIGHT_BUTTON);
-            putBoolean(editor, values, ConfigContract.VOICE_ENABLED);
-            putBoolean(editor, values, ConfigContract.KEY_BORDER);
-            putInt(editor, values, ConfigContract.BLUR_RADIUS);
-            putInt(editor, values, ConfigContract.BG_ALPHA);
-            putInt(editor, values, ConfigContract.KEY_ALPHA);
-            putInt(editor, values, ConfigContract.CORNER_RADIUS);
+            // Provider 可能同时收到多个设置页写入，revision 与配置必须在同一临界区递增。
+            synchronized (this) {
+                SharedPreferences sp = preferences();
+                SharedPreferences.Editor editor = sp.edit();
+                putBoolean(editor, values, ConfigContract.SHOW_LEFT_BUTTON);
+                putBoolean(editor, values, ConfigContract.SHOW_RIGHT_BUTTON);
+                putBoolean(editor, values, ConfigContract.VOICE_ENABLED);
+                putBoolean(editor, values, ConfigContract.KEY_BORDER);
+                putInt(editor, values, ConfigContract.BLUR_RADIUS);
+                putInt(editor, values, ConfigContract.BG_ALPHA);
+                putInt(editor, values, ConfigContract.KEY_ALPHA);
+                putInt(editor, values, ConfigContract.CORNER_RADIUS);
 
-            if (!editor.commit()) {
-                Log.w(TAG, "ConfigProvider.write commit returned false");
-                return 0;
+                long revision = ConfigContract.nextRevision(
+                        sp.getLong(ConfigContract.REVISION, ConfigContract.DEFAULT_REVISION));
+                editor.putLong(ConfigContract.REVISION, revision);
+                if (!editor.commit()) {
+                    Log.w(TAG, "ConfigProvider.write commit returned false");
+                    return 0;
+                }
+                getContext().getContentResolver().notifyChange(ConfigContract.CONTENT_URI, null);
+                Log.i(TAG, "ConfigProvider.write config rev=" + revision);
+                return 1;
             }
-            getContext().getContentResolver().notifyChange(ConfigContract.CONTENT_URI, null);
-            Log.i(TAG, "ConfigProvider.write config");
-            return 1;
         } catch (Exception e) {
             Log.w(TAG, "ConfigProvider.write failed", e);
             return 0;
@@ -79,19 +87,23 @@ public class ConfigProvider extends ContentProvider {
             throw new SecurityException("config query is not available to this caller");
         }
 
-        SharedPreferences sp = preferences();
-        MatrixCursor cursor = new MatrixCursor(COLUMNS);
-        cursor.addRow(new Object[]{
-                sp.getBoolean(ConfigContract.SHOW_LEFT_BUTTON, ConfigContract.DEFAULT_LEFT_BUTTON) ? 1 : 0,
-                sp.getBoolean(ConfigContract.SHOW_RIGHT_BUTTON, ConfigContract.DEFAULT_RIGHT_BUTTON) ? 1 : 0,
-                sp.getBoolean(ConfigContract.VOICE_ENABLED, ConfigContract.DEFAULT_VOICE) ? 1 : 0,
-                sp.getBoolean(ConfigContract.KEY_BORDER, ConfigContract.DEFAULT_KEY_BORDER) ? 1 : 0,
-                sp.getInt(ConfigContract.BLUR_RADIUS, ConfigContract.DEFAULT_BLUR),
-                sp.getInt(ConfigContract.BG_ALPHA, ConfigContract.DEFAULT_ALPHA),
-                sp.getInt(ConfigContract.KEY_ALPHA, ConfigContract.DEFAULT_KEY_ALPHA),
-                sp.getInt(ConfigContract.CORNER_RADIUS, ConfigContract.DEFAULT_CORNER)
-        });
-        return cursor;
+        // 与 update 使用同一把锁，避免 revision 和各配置字段来自不同写入。
+        synchronized (this) {
+            SharedPreferences sp = preferences();
+            MatrixCursor cursor = new MatrixCursor(COLUMNS);
+            cursor.addRow(new Object[]{
+                    sp.getLong(ConfigContract.REVISION, ConfigContract.DEFAULT_REVISION),
+                    sp.getBoolean(ConfigContract.SHOW_LEFT_BUTTON, ConfigContract.DEFAULT_LEFT_BUTTON) ? 1 : 0,
+                    sp.getBoolean(ConfigContract.SHOW_RIGHT_BUTTON, ConfigContract.DEFAULT_RIGHT_BUTTON) ? 1 : 0,
+                    sp.getBoolean(ConfigContract.VOICE_ENABLED, ConfigContract.DEFAULT_VOICE) ? 1 : 0,
+                    sp.getBoolean(ConfigContract.KEY_BORDER, ConfigContract.DEFAULT_KEY_BORDER) ? 1 : 0,
+                    sp.getInt(ConfigContract.BLUR_RADIUS, ConfigContract.DEFAULT_BLUR),
+                    sp.getInt(ConfigContract.BG_ALPHA, ConfigContract.DEFAULT_ALPHA),
+                    sp.getInt(ConfigContract.KEY_ALPHA, ConfigContract.DEFAULT_KEY_ALPHA),
+                    sp.getInt(ConfigContract.CORNER_RADIUS, ConfigContract.DEFAULT_CORNER)
+            });
+            return cursor;
+        }
     }
 
     private SharedPreferences preferences() {
@@ -110,7 +122,9 @@ public class ConfigProvider extends ContentProvider {
      */
     private synchronized void migrateLegacyActivityPreferences() {
         SharedPreferences target = rawPreferences();
-        if (target.contains(ConfigContract.BLUR_RADIUS)) return;
+        // revision 也作为统一配置已初始化标记；设置页 fallback 可能只写了增量字段。
+        if (target.contains(ConfigContract.BLUR_RADIUS)
+                || target.contains(ConfigContract.REVISION)) return;
 
         // Android Activity.getLocalClassName() 在不同实现中可能保留或省略开头的点。
         String[] legacyNames = {
@@ -143,6 +157,9 @@ public class ConfigProvider extends ContentProvider {
                     .putBoolean(ConfigContract.KEY_BORDER,
                             legacy.getBoolean(ConfigContract.KEY_BORDER,
                                     ConfigContract.DEFAULT_KEY_BORDER))
+                    .putLong(ConfigContract.REVISION,
+                            ConfigContract.nextRevision(target.getLong(
+                                    ConfigContract.REVISION, ConfigContract.DEFAULT_REVISION)))
                     .commit();
             if (migrated) Log.i(TAG, "migrated legacy activity preferences");
             return;
