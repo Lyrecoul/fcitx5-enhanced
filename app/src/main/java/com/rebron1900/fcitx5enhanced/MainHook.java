@@ -246,7 +246,11 @@ public class MainHook extends XposedModule {
         // 仅作为旧版本升级兜底；新版本不再写入目标进程 SP。
         Config config = new Config();
         try {
-            SharedPreferences sp = anyView.getContext().getSharedPreferences(
+            android.content.Context configContext = anyView.getContext();
+            if (android.os.Build.VERSION.SDK_INT >= 24) {
+                configContext = configContext.createDeviceProtectedStorageContext();
+            }
+            SharedPreferences sp = configContext.getSharedPreferences(
                     ConfigContract.PREFS_NAME, android.content.Context.MODE_PRIVATE);
             config.blur = sp.getInt(ConfigContract.BLUR_RADIUS, ConfigContract.DEFAULT_BLUR);
             config.alpha = sp.getInt(ConfigContract.BG_ALPHA, ConfigContract.DEFAULT_ALPHA);
