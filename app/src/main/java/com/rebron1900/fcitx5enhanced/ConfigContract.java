@@ -14,6 +14,8 @@ public final class ConfigContract {
     public static final String AUTHORITY = "com.rebron1900.fcitx5enhanced.config";
     public static final Uri CONTENT_URI = Uri.parse("content://" + AUTHORITY + "/config");
     public static final String PREFS_NAME = "fcitx5_enhanced_config";
+    /** 仅允许目标输入法将其私有旧 JSON 配置迁移至 Provider。 */
+    public static final String MIGRATE_LEGACY_SELECTION = "migrate_legacy_config";
     /** 每次配置写入递增；用于跨进程通知去重和补偿 Provider 晚启动。 */
     public static final String REVISION = "config_revision";
     public static final long DEFAULT_REVISION = 0L;
