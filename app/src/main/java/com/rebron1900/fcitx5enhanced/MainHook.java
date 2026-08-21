@@ -15,13 +15,8 @@ import android.graphics.Outline;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 
-import java.io.BufferedReader;
-import java.io.File;
-import java.io.FileReader;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-
-import org.json.JSONObject;
 
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
@@ -230,10 +225,6 @@ public class MainHook extends XposedModule {
                 ConfigContract.CONTENT_URI, null, null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) {
                 Config config = ConfigContract.fromCursor(cursor);
-                if (config.revision == ConfigContract.DEFAULT_REVISION) {
-                    Config legacyConfig = migrateLegacyJsonConfig(anyView);
-                    if (legacyConfig != null) config = legacyConfig;
-                }
                 Log.i(TAG, "readConfig from provider: rev=" + config.revision
                         + " blur=" + config.blur + " alpha=" + config.alpha
                         + " L=" + config.leftBtn + " R=" + config.rightBtn);
@@ -271,53 +262,6 @@ public class MainHook extends XposedModule {
         }
         ConfigContract.sanitize(config);
         return config;
-    }
-
-    /**
-     * v1.9.1 及以前的设置存于输入法自身 externalFilesDir 的 JSON；模块进程无权
-     * 直接读取，但 Hook 正运行在输入法进程中。仅在 Provider 尚未初始化时导入一次。
-     */
-    private static Config migrateLegacyJsonConfig(View anyView) {
-        try {
-            File directory = anyView.getContext().getExternalFilesDir(null);
-            if (directory == null) return null;
-            File file = new File(directory, "fcitx5_enhanced_config.json");
-            if (!file.isFile()) return null;
-
-            StringBuilder jsonText = new StringBuilder();
-            try (BufferedReader reader = new BufferedReader(new FileReader(file))) {
-                String line;
-                while ((line = reader.readLine()) != null) jsonText.append(line);
-            }
-            JSONObject json = new JSONObject(jsonText.toString());
-            if (!json.has(ConfigContract.BLUR_RADIUS)) return null;
-
-            Config config = new Config();
-            config.blur = json.optInt(ConfigContract.BLUR_RADIUS, ConfigContract.DEFAULT_BLUR);
-            config.alpha = json.optInt(ConfigContract.BG_ALPHA, ConfigContract.DEFAULT_ALPHA);
-            config.keyAlpha = json.optInt(ConfigContract.KEY_ALPHA, ConfigContract.DEFAULT_KEY_ALPHA);
-            config.corner = json.optInt(ConfigContract.CORNER_RADIUS, ConfigContract.DEFAULT_CORNER);
-            config.voice = json.optBoolean(ConfigContract.VOICE_ENABLED, ConfigContract.DEFAULT_VOICE);
-            config.leftBtn = json.optBoolean(ConfigContract.SHOW_LEFT_BUTTON,
-                    ConfigContract.DEFAULT_LEFT_BUTTON);
-            config.rightBtn = json.optBoolean(ConfigContract.SHOW_RIGHT_BUTTON,
-                    ConfigContract.DEFAULT_RIGHT_BUTTON);
-            config.keyBorder = json.optBoolean(ConfigContract.KEY_BORDER,
-                    ConfigContract.DEFAULT_KEY_BORDER);
-            ConfigContract.sanitize(config);
-
-            int migrated = anyView.getContext().getContentResolver().update(
-                    ConfigContract.CONTENT_URI, ConfigContract.toValues(config),
-                    ConfigContract.MIGRATE_LEGACY_SELECTION, null);
-            if (migrated > 0) {
-                config.revision = ConfigContract.nextRevision(ConfigContract.DEFAULT_REVISION);
-                Log.i(TAG, "migrated legacy JSON config");
-            }
-            return config;
-        } catch (Throwable t) {
-            Log.w(TAG, "legacy JSON config migration failed: " + t.getMessage());
-            return null;
-        }
     }
 
     private static Config copyConfig(Config source) {

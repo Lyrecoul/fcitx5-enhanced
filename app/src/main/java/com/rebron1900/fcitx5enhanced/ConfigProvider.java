@@ -38,13 +38,12 @@ public class ConfigProvider extends ContentProvider {
         return "vnd.android.cursor.dir/vnd.fcitx5enhanced.config";
     }
 
-    /** 模块设置页写入；目标输入法仅可提交一次旧 JSON 配置迁移。 */
+    /** 仅允许模块 SettingsActivity 写入。 */
     @Override
     public int update(Uri uri, ContentValues values, String selection, String[] selectionArgs) {
         requireValidUri(uri);
-        boolean legacyMigration = ConfigContract.MIGRATE_LEGACY_SELECTION.equals(selection);
-        if (legacyMigration ? !isAllowedReader() : !isModuleCaller()) {
-            throw new SecurityException("config update is not available to this caller");
+        if (!isModuleCaller()) {
+            throw new SecurityException("config update is only available to the module");
         }
         if (values == null || values.size() == 0) return 0;
 
@@ -52,11 +51,6 @@ public class ConfigProvider extends ContentProvider {
             // Provider 可能同时收到多个设置页写入，revision 与配置必须在同一临界区递增。
             synchronized (this) {
                 SharedPreferences sp = preferences();
-                // 旧 JSON 只能填补尚未初始化的 Provider，绝不能覆盖新版设置页保存的数据。
-                if (legacyMigration && (sp.contains(ConfigContract.REVISION)
-                        || sp.contains(ConfigContract.BLUR_RADIUS))) {
-                    return 0;
-                }
                 SharedPreferences.Editor editor = sp.edit();
                 putBoolean(editor, values, ConfigContract.SHOW_LEFT_BUTTON);
                 putBoolean(editor, values, ConfigContract.SHOW_RIGHT_BUTTON);
