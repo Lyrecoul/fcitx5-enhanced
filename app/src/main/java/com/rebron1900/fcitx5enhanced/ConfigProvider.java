@@ -128,6 +128,8 @@ public class ConfigProvider extends ContentProvider {
 
         // Android Activity.getLocalClassName() 在不同实现中可能保留或省略开头的点。
         String[] legacyNames = {
+                // Activity.getPreferences() 实际使用 packageName + "_preferences"。
+                getContext().getPackageName() + "_preferences",
                 ".SettingsActivity",
                 "SettingsActivity",
                 "com.rebron1900.fcitx5enhanced.SettingsActivity"
