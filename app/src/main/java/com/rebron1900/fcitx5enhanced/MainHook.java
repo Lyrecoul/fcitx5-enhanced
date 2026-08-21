@@ -1,10 +1,15 @@
 package com.rebron1900.fcitx5enhanced;
 
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
 import android.content.ContentResolver;
+import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.database.ContentObserver;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Bundle;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.View;
@@ -69,6 +74,8 @@ public class MainHook extends XposedModule {
     private boolean mConfigObserved;
     private ContentResolver mConfigResolver;
     private boolean mLastConfigReadFromProvider;
+    private boolean mHasTrustedConfig;
+    private boolean mConfigRequestPending;
     private Runnable mConfigReadRetry;
     private int mConfigReadRetryAttempt;
 
@@ -93,6 +100,7 @@ public class MainHook extends XposedModule {
         INPUT_VIEW,
         WINDOW_SHOWN,
         CONFIG_CHANGED,
+        CONFIG_RESPONSE,
         THEME_CHANGED
     }
 
@@ -104,6 +112,8 @@ public class MainHook extends XposedModule {
     /** Provider 短暂不可用时保留最后一个可信快照，避免回退到目标进程旧 SP。 */
     private static volatile Config sLastProviderConfig;
     private static volatile boolean sLastConfigReadFromProvider;
+    /** Provider 或旧版 SP 提供了真实配置；false 时不得把构造出的默认值应用到键盘。 */
+    private static volatile boolean sLastConfigReadIsTrusted;
 
     private static final java.util.WeakHashMap<View,
             java.lang.ref.WeakReference<android.graphics.drawable.Drawable>>
@@ -138,7 +148,6 @@ public class MainHook extends XposedModule {
                 if (v != null) {
                     // setInputView 的参数就是目标输入法 View，不依赖被 R8 混淆的类名。
                     registerThemePrefListener(v);
-                    registerConfigObserver(v);
                     mCurrentInputViewRef = new java.lang.ref.WeakReference<>(v);
                     View fv = v;
                     if (fv.getWidth() > 0 && fv.getHeight() > 0) {
@@ -172,8 +181,6 @@ public class MainHook extends XposedModule {
                 chain.proceed();
                 View cv = getCurrentInputView();
                 if (cv != null) {
-                    // 窗口显示时主动拉取一次，补偿 Provider/Observer 暂时不可用的情况。
-                    registerConfigObserver(cv);
                     final int generation = mLifecycleGeneration;
                     cv.post(() -> {
                         if (!isCurrentGeneration(cv, generation)) return;
@@ -211,16 +218,71 @@ public class MainHook extends XposedModule {
     //  Config — Provider 读取，旧版目标进程 SP 兜底
     // ══════════════════════════════════════════
 
-    /** 从模块 SharedPreferences Provider 读取配置，失败时兼容旧版目标进程 SP。 */
-    private void readConfig(View anyView) {
+    /** 显式广播请求不受目标输入法 Manifest 包可见性声明限制。 */
+    private boolean readConfig(View anyView) {
+        requestConfig(anyView.getContext());
         cfg = readConfigSync(anyView);
         mLastConfigReadFromProvider = sLastConfigReadFromProvider;
+        mHasTrustedConfig = sLastConfigReadIsTrusted;
         if (mLastConfigReadFromProvider) cancelConfigReadRetry();
+        return mHasTrustedConfig;
+    }
+
+    private void requestConfig(Context context) {
+        if (mConfigRequestPending) return;
+        mConfigRequestPending = true;
+        Intent request = new Intent(ConfigRequestReceiver.ACTION_REQUEST);
+        request.setComponent(new ComponentName(
+                ConfigContract.MODULE_PACKAGE, ConfigRequestReceiver.class.getName()));
+        try {
+            context.sendOrderedBroadcast(request, null, new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context receiverContext, Intent intent) {
+                    mConfigRequestPending = false;
+                    Bundle result = getResultExtras(false);
+                    Bundle values = result != null
+                            ? result.getBundle(ConfigRequestReceiver.EXTRA_CONFIG) : null;
+                    if (values == null) {
+                        scheduleConfigReadRetry();
+                        return;
+                    }
+                    cfg = configFromBundle(values);
+                    mHasTrustedConfig = true;
+                    mLastConfigReadFromProvider = true;
+                    cancelConfigReadRetry();
+                    Log.i(TAG, "readConfig from explicit broadcast: rev=" + cfg.revision);
+                    View current = getCurrentInputView();
+                    if (current != null) applyAllEffects(current, ApplyReason.CONFIG_RESPONSE);
+                }
+            }, mMainHandler, android.app.Activity.RESULT_CANCELED, null, null);
+        } catch (Throwable t) {
+            mConfigRequestPending = false;
+            Log.w(TAG, "config broadcast request failed: " + t.getMessage());
+        }
+    }
+
+    private static Config configFromBundle(Bundle values) {
+        Config config = new Config();
+        config.revision = values.getLong(ConfigContract.REVISION, ConfigContract.DEFAULT_REVISION);
+        config.blur = values.getInt(ConfigContract.BLUR_RADIUS, ConfigContract.DEFAULT_BLUR);
+        config.alpha = values.getInt(ConfigContract.BG_ALPHA, ConfigContract.DEFAULT_ALPHA);
+        config.keyAlpha = values.getInt(ConfigContract.KEY_ALPHA, ConfigContract.DEFAULT_KEY_ALPHA);
+        config.corner = values.getInt(ConfigContract.CORNER_RADIUS, ConfigContract.DEFAULT_CORNER);
+        config.voice = values.getBoolean(ConfigContract.VOICE_ENABLED, ConfigContract.DEFAULT_VOICE);
+        config.leftBtn = values.getBoolean(
+                ConfigContract.SHOW_LEFT_BUTTON, ConfigContract.DEFAULT_LEFT_BUTTON);
+        config.rightBtn = values.getBoolean(
+                ConfigContract.SHOW_RIGHT_BUTTON, ConfigContract.DEFAULT_RIGHT_BUTTON);
+        config.keyBorder = values.getBoolean(
+                ConfigContract.KEY_BORDER, ConfigContract.DEFAULT_KEY_BORDER);
+        ConfigContract.sanitize(config);
+        return config;
     }
 
     /** 同步读取配置（static，供外部调用）。 */
     public static Config readConfigSync(View anyView) {
         sLastConfigReadFromProvider = false;
+        sLastConfigReadIsTrusted = false;
         try (android.database.Cursor cursor = anyView.getContext().getContentResolver().query(
                 ConfigContract.CONTENT_URI, null, null, null, null)) {
             if (cursor != null && cursor.moveToFirst()) {
@@ -230,6 +292,7 @@ public class MainHook extends XposedModule {
                         + " L=" + config.leftBtn + " R=" + config.rightBtn);
                 sLastProviderConfig = copyConfig(config);
                 sLastConfigReadFromProvider = true;
+                sLastConfigReadIsTrusted = true;
                 return config;
             }
         } catch (Throwable t) {
@@ -240,6 +303,7 @@ public class MainHook extends XposedModule {
         Config lastProviderConfig = sLastProviderConfig;
         if (lastProviderConfig != null) {
             Log.w(TAG, "provider unavailable, using last provider snapshot");
+            sLastConfigReadIsTrusted = true;
             return copyConfig(lastProviderConfig);
         }
 
@@ -248,6 +312,8 @@ public class MainHook extends XposedModule {
         try {
             SharedPreferences sp = anyView.getContext().getSharedPreferences(
                     ConfigContract.PREFS_NAME, android.content.Context.MODE_PRIVATE);
+            sLastConfigReadIsTrusted = sp.contains(ConfigContract.REVISION)
+                    || sp.contains(ConfigContract.BLUR_RADIUS);
             config.blur = sp.getInt(ConfigContract.BLUR_RADIUS, ConfigContract.DEFAULT_BLUR);
             config.alpha = sp.getInt(ConfigContract.BG_ALPHA, ConfigContract.DEFAULT_ALPHA);
             config.keyAlpha = sp.getInt(ConfigContract.KEY_ALPHA, ConfigContract.DEFAULT_KEY_ALPHA);
@@ -285,11 +351,12 @@ public class MainHook extends XposedModule {
 
     private void applyAllEffects(View inputView, ApplyReason reason) {
         // 主题自身变化不影响模块配置，避免每次主题回调都同步跨进程 query。
-        if (reason != ApplyReason.THEME_CHANGED) {
+        if (reason != ApplyReason.THEME_CHANGED && reason != ApplyReason.CONFIG_RESPONSE) {
             readConfig(inputView);
-            if (!mLastConfigReadFromProvider && mConfigObserved) {
-                scheduleConfigReadRetry();
-            }
+        }
+        if (!mHasTrustedConfig) {
+            Log.w(TAG, "applyAllEffects deferred: no trusted config available");
+            return;
         }
 
         // 窗口显示和配置通知都按 revision/内容去重；输入法 View/主题变化仍强制重应用。
@@ -527,7 +594,7 @@ public class MainHook extends XposedModule {
     //  ConfigProvider ContentObserver
     // ══════════════════════════════════════════
 
-    /** 监听 ConfigProvider 变化（SettingsActivity 写入时触发）。 */
+    /** 监听 ConfigProvider 变化，兼容 Provider 对目标进程可见的系统。 */
     private void registerConfigObserver(View anyView) {
         if (mConfigObserved) return;
         try {
@@ -577,7 +644,7 @@ public class MainHook extends XposedModule {
     }
 
     private void scheduleConfigReadRetry() {
-        if (!mConfigObserved || mConfigReadRetry != null || mConfigReadRetryAttempt >= 5) return;
+        if (mConfigReadRetry != null || mConfigReadRetryAttempt >= 5) return;
         long delay = Math.min(CONFIG_RETRY_MAX_MS,
                 CONFIG_RETRY_INITIAL_MS << Math.min(mConfigReadRetryAttempt, 4));
         mConfigReadRetryAttempt++;
@@ -620,6 +687,7 @@ public class MainHook extends XposedModule {
         }
         mConfigResolver = null;
         mConfigObserved = false;
+        mConfigRequestPending = false;
         if (mThemePreferences != null && mThemePrefListener != null) {
             try {
                 mThemePreferences.unregisterOnSharedPreferenceChangeListener(mThemePrefListener);
