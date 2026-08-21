@@ -37,7 +37,6 @@
         <provider
             android:name=".ConfigProvider"
             android:authorities="com.rebron1900.fcitx5enhanced.config"
-            android:directBootAware="true"
             android:exported="true" />
 
     </application>

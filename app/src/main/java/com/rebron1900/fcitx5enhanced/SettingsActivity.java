@@ -70,12 +70,7 @@ public class SettingsActivity extends Activity {
     // ══════════════════════════════════════════
 
     private SharedPreferences getConfigPreferences() {
-        // 配置需要在输入法 Direct Boot 阶段可读，设置页也统一写入设备保护存储。
-        android.content.Context context = this;
-        if (android.os.Build.VERSION.SDK_INT >= 24) {
-            context = context.createDeviceProtectedStorageContext();
-        }
-        return context.getSharedPreferences(ConfigContract.PREFS_NAME, MODE_PRIVATE);
+        return getSharedPreferences(ConfigContract.PREFS_NAME, MODE_PRIVATE);
     }
 
     private void loadSettings() {

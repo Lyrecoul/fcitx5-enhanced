@@ -30,37 +30,7 @@ public class ConfigProvider extends ContentProvider {
 
     @Override
     public boolean onCreate() {
-        if (getContext() == null) return false;
-        // 输入法可能在用户解锁前启动；配置必须能在 Direct Boot 阶段读取。
-        if (android.os.Build.VERSION.SDK_INT >= 24) {
-            try {
-                android.content.BroadcastReceiver receiver = new android.content.BroadcastReceiver() {
-                    @Override
-                    public void onReceive(android.content.Context context,
-                                          android.content.Intent intent) {
-                        if (android.content.Intent.ACTION_USER_UNLOCKED.equals(intent.getAction())) {
-                            synchronized (ConfigProvider.this) {
-                                migrateCredentialProtectedPreferences();
-                                migrateLegacyActivityPreferences();
-                            }
-                            context.getContentResolver().notifyChange(
-                                    ConfigContract.CONTENT_URI, null);
-                        }
-                    }
-                };
-                android.content.IntentFilter filter = new android.content.IntentFilter(
-                        android.content.Intent.ACTION_USER_UNLOCKED);
-                if (android.os.Build.VERSION.SDK_INT >= 33) {
-                    getContext().registerReceiver(receiver, filter,
-                            android.content.Context.RECEIVER_NOT_EXPORTED);
-                } else {
-                    getContext().registerReceiver(receiver, filter);
-                }
-            } catch (Throwable t) {
-                Log.w(TAG, "user unlock receiver registration failed", t);
-            }
-        }
-        return true;
+        return getContext() != null;
     }
 
     @Override
@@ -137,55 +107,13 @@ public class ConfigProvider extends ContentProvider {
     }
 
     private SharedPreferences preferences() {
-        migrateCredentialProtectedPreferences();
         migrateLegacyActivityPreferences();
         return rawPreferences();
     }
 
     private SharedPreferences rawPreferences() {
-        android.content.Context context = getContext();
-        if (android.os.Build.VERSION.SDK_INT >= 24) {
-            context = context.createDeviceProtectedStorageContext();
-        }
-        return context.getSharedPreferences(
+        return getContext().getSharedPreferences(
                 ConfigContract.PREFS_NAME, android.content.Context.MODE_PRIVATE);
-    }
-
-    /** 将升级前存于凭据保护存储的配置迁移到可在 Direct Boot 阶段读取的位置。 */
-    private synchronized void migrateCredentialProtectedPreferences() {
-        if (android.os.Build.VERSION.SDK_INT < 24
-                || !((android.os.UserManager) getContext().getSystemService(
-                        android.content.Context.USER_SERVICE)).isUserUnlocked()) return;
-
-        SharedPreferences target = rawPreferences();
-        if (target.contains(ConfigContract.REVISION)
-                || target.contains(ConfigContract.BLUR_RADIUS)) return;
-
-        SharedPreferences source = getContext().getSharedPreferences(
-                ConfigContract.PREFS_NAME, android.content.Context.MODE_PRIVATE);
-        if (!source.contains(ConfigContract.REVISION)
-                && !source.contains(ConfigContract.BLUR_RADIUS)) return;
-
-        SharedPreferences.Editor editor = target.edit();
-        editor.putLong(ConfigContract.REVISION,
-                source.getLong(ConfigContract.REVISION, ConfigContract.DEFAULT_REVISION));
-        editor.putInt(ConfigContract.BLUR_RADIUS,
-                source.getInt(ConfigContract.BLUR_RADIUS, ConfigContract.DEFAULT_BLUR));
-        editor.putInt(ConfigContract.BG_ALPHA,
-                source.getInt(ConfigContract.BG_ALPHA, ConfigContract.DEFAULT_ALPHA));
-        editor.putInt(ConfigContract.KEY_ALPHA,
-                source.getInt(ConfigContract.KEY_ALPHA, ConfigContract.DEFAULT_KEY_ALPHA));
-        editor.putInt(ConfigContract.CORNER_RADIUS,
-                source.getInt(ConfigContract.CORNER_RADIUS, ConfigContract.DEFAULT_CORNER));
-        editor.putBoolean(ConfigContract.VOICE_ENABLED,
-                source.getBoolean(ConfigContract.VOICE_ENABLED, ConfigContract.DEFAULT_VOICE));
-        editor.putBoolean(ConfigContract.SHOW_LEFT_BUTTON,
-                source.getBoolean(ConfigContract.SHOW_LEFT_BUTTON, ConfigContract.DEFAULT_LEFT_BUTTON));
-        editor.putBoolean(ConfigContract.SHOW_RIGHT_BUTTON,
-                source.getBoolean(ConfigContract.SHOW_RIGHT_BUTTON, ConfigContract.DEFAULT_RIGHT_BUTTON));
-        editor.putBoolean(ConfigContract.KEY_BORDER,
-                source.getBoolean(ConfigContract.KEY_BORDER, ConfigContract.DEFAULT_KEY_BORDER));
-        if (editor.commit()) Log.i(TAG, "migrated credential protected config");
     }
 
     /**
@@ -193,9 +121,6 @@ public class ConfigProvider extends ContentProvider {
      * 避免用户升级后必须先打开设置页才能恢复已有配置。
      */
     private synchronized void migrateLegacyActivityPreferences() {
-        if (android.os.Build.VERSION.SDK_INT >= 24
-                && !((android.os.UserManager) getContext().getSystemService(
-                        android.content.Context.USER_SERVICE)).isUserUnlocked()) return;
         SharedPreferences target = rawPreferences();
         // revision 也作为统一配置已初始化标记；设置页 fallback 可能只写了增量字段。
         if (target.contains(ConfigContract.BLUR_RADIUS)
