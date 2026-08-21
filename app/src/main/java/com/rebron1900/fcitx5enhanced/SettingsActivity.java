@@ -2,6 +2,7 @@ package com.rebron1900.fcitx5enhanced;
 
 import android.app.Activity;
 import android.content.ContentValues;
+import android.content.Context;
 import android.content.SharedPreferences;
 import android.os.Bundle;
 import android.util.Log;
@@ -80,6 +81,7 @@ public class SettingsActivity extends Activity {
 
     private void loadSettings() {
         SharedPreferences sp = getConfigPreferences();
+        migrateCredentialProtectedSettings(sp);
         migrateLegacySettings(sp);
 
         sbBlur.setProgress(clamp(sp.getInt(ConfigContract.BLUR_RADIUS,
@@ -96,6 +98,42 @@ public class SettingsActivity extends Activity {
         swKeyBorder.setChecked(sp.getBoolean(ConfigContract.KEY_BORDER, ConfigContract.DEFAULT_KEY_BORDER));
         updateLabels();
         mSavedConfig = captureConfig();
+    }
+
+    /** 将旧版本普通凭据保护存储中的统一配置迁移到设备保护存储。 */
+    private void migrateCredentialProtectedSettings(SharedPreferences target) {
+        if (android.os.Build.VERSION.SDK_INT < 24
+                || !((android.os.UserManager) getSystemService(Context.USER_SERVICE)).isUserUnlocked()) {
+            return;
+        }
+        if (target.contains(ConfigContract.BLUR_RADIUS)
+                || target.contains(ConfigContract.REVISION)) return;
+
+        SharedPreferences source = getSharedPreferences(ConfigContract.PREFS_NAME, MODE_PRIVATE);
+        if (!source.contains(ConfigContract.BLUR_RADIUS)
+                && !source.contains(ConfigContract.REVISION)) return;
+
+        target.edit()
+                .putLong(ConfigContract.REVISION,
+                        source.getLong(ConfigContract.REVISION, ConfigContract.DEFAULT_REVISION))
+                .putInt(ConfigContract.BLUR_RADIUS,
+                        source.getInt(ConfigContract.BLUR_RADIUS, ConfigContract.DEFAULT_BLUR))
+                .putInt(ConfigContract.BG_ALPHA,
+                        source.getInt(ConfigContract.BG_ALPHA, ConfigContract.DEFAULT_ALPHA))
+                .putInt(ConfigContract.KEY_ALPHA,
+                        source.getInt(ConfigContract.KEY_ALPHA, ConfigContract.DEFAULT_KEY_ALPHA))
+                .putInt(ConfigContract.CORNER_RADIUS,
+                        source.getInt(ConfigContract.CORNER_RADIUS, ConfigContract.DEFAULT_CORNER))
+                .putBoolean(ConfigContract.VOICE_ENABLED,
+                        source.getBoolean(ConfigContract.VOICE_ENABLED, ConfigContract.DEFAULT_VOICE))
+                .putBoolean(ConfigContract.SHOW_LEFT_BUTTON,
+                        source.getBoolean(ConfigContract.SHOW_LEFT_BUTTON, ConfigContract.DEFAULT_LEFT_BUTTON))
+                .putBoolean(ConfigContract.SHOW_RIGHT_BUTTON,
+                        source.getBoolean(ConfigContract.SHOW_RIGHT_BUTTON, ConfigContract.DEFAULT_RIGHT_BUTTON))
+                .putBoolean(ConfigContract.KEY_BORDER,
+                        source.getBoolean(ConfigContract.KEY_BORDER, ConfigContract.DEFAULT_KEY_BORDER))
+                .commit();
+        Log.i(TAG, "migrated credential protected config");
     }
 
     /** 将旧版 Activity 私有 SP 迁移到新的统一配置 SP。 */
